@@ -568,6 +568,8 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let providerMilliseconds: Double
         let appleFrameProcessingMilliseconds: Double
         let captureToReadyMilliseconds: Double
+        let proxyCacheHits: Int
+        let proxyCacheMisses: Int
     }
 
     private let queue = DispatchQueue(label: "switchviewer.frame-interpolation")
@@ -832,7 +834,9 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         providerMilliseconds: providerMilliseconds,
                         appleFrameProcessingMilliseconds: result?.processorMilliseconds ?? 0,
                         captureToReadyMilliseconds: (ProcessInfo.processInfo.systemUptime
-                                                     - input.submittedAtUptime) * 1_000))
+                                                     - input.submittedAtUptime) * 1_000,
+                        proxyCacheHits: result?.proxyCacheHits ?? 0,
+                        proxyCacheMisses: result?.proxyCacheMisses ?? 0))
                     if let errorMessage {
                         self.processingDisabledError = errorMessage
                         input.completion(nil, input.buffer, errorMessage, nil)
@@ -895,7 +899,9 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         providerMilliseconds: providerMilliseconds,
                         appleFrameProcessingMilliseconds: 0,
                         captureToReadyMilliseconds: (ProcessInfo.processInfo.systemUptime
-                                                     - input.submittedAtUptime) * 1_000))
+                                                     - input.submittedAtUptime) * 1_000,
+                        proxyCacheHits: 0,
+                        proxyCacheMisses: 0))
                     if let errorMessage {
                         self.processingDisabledError = errorMessage
                         input.completion(nil, input.buffer, errorMessage, nil)
@@ -965,7 +971,9 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                     providerMilliseconds: providerMilliseconds,
                     appleFrameProcessingMilliseconds: providerMilliseconds,
                     captureToReadyMilliseconds: (ProcessInfo.processInfo.systemUptime
-                                                 - input.submittedAtUptime) * 1_000))
+                                                 - input.submittedAtUptime) * 1_000,
+                    proxyCacheHits: 0,
+                    proxyCacheMisses: 0))
                 let halfInterval = CMTimeGetSeconds(interval) / 2
                 let frameDuration = halfInterval.isFinite && halfInterval > 0 && halfInterval < 0.5
                     ? halfInterval : nil
@@ -1034,7 +1042,9 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             func range(_ select: (TimingSample) -> Double) -> String {
                 String(format: "%.1f/%.1f", percentile(select, 0.50), percentile(select, 0.95))
             }
-            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); preprocess=\(range(\.preprocessingMilliseconds)); apple=\(range(\.appleFrameProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
+            let proxyCacheHits = values.reduce(0) { $0 + $1.proxyCacheHits }
+            let proxyCacheMisses = values.reduce(0) { $0 + $1.proxyCacheMisses }
+            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); preprocess=\(range(\.preprocessingMilliseconds)); proxyCache=\(proxyCacheHits)/\(proxyCacheMisses); apple=\(range(\.appleFrameProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
         }
         timingSamples.removeAll(keepingCapacity: true)
     }

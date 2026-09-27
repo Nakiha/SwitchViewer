@@ -16,6 +16,8 @@ public final class AppleDownsampledFrameInterpolator {
         public let processorMilliseconds: Double
         public let outputWidth: Int
         public let outputHeight: Int
+        public let proxyCacheHits: Int
+        public let proxyCacheMisses: Int
     }
 
     public enum InterpolationError: Error, CustomStringConvertible {
@@ -65,6 +67,13 @@ public final class AppleDownsampledFrameInterpolator {
     private let proxyOutputPool: CVPixelBufferPool
     private let scaler: NV12Scaler
     private let processLock = NSLock()
+    private struct CachedProxyFrame {
+        let presentationTimeStamp: CMTime
+        let pixelBuffer: CVPixelBuffer
+    }
+    private let proxyCacheCapacity = 4
+    private var proxyCache: [CachedProxyFrame] = []
+    private var lastCurrentPresentationTimeStamp: CMTime?
     private var sessionStarted = false
 
     public init(width: Int = 3840, height: Int = 2160,
@@ -123,9 +132,20 @@ public final class AppleDownsampledFrameInterpolator {
             throw InterpolationError.invalidDimensions
         }
 
+        if let lastCurrentPresentationTimeStamp,
+           isNumeric(currentPresentationTimeStamp),
+           isNumeric(lastCurrentPresentationTimeStamp),
+           CMTimeCompare(currentPresentationTimeStamp, lastCurrentPresentationTimeStamp) < 0 {
+            proxyCache.removeAll(keepingCapacity: true)
+        }
+        lastCurrentPresentationTimeStamp = isNumeric(currentPresentationTimeStamp)
+            ? currentPresentationTimeStamp : nil
+
         let start = ProcessInfo.processInfo.systemUptime
-        let proxyPrevious = try makePixelBuffer(from: previous, pool: proxyInputPool)
-        let proxyCurrent = try makePixelBuffer(from: current, pool: proxyInputPool)
+        let (proxyPrevious, previousWasCached) = try proxyPixelBuffer(
+            from: previous, presentationTimeStamp: previousPresentationTimeStamp)
+        let (proxyCurrent, currentWasCached) = try proxyPixelBuffer(
+            from: current, presentationTimeStamp: currentPresentationTimeStamp)
         let proxyEnd = ProcessInfo.processInfo.systemUptime
 
         let midpoint = CMTimeAdd(previousPresentationTimeStamp,
@@ -177,7 +197,35 @@ public final class AppleDownsampledFrameInterpolator {
                       resizeMilliseconds: (proxyEnd - start) * 1_000,
                       processorMilliseconds: (processorEnd - proxyEnd) * 1_000,
                       outputWidth: CVPixelBufferGetWidth(proxyOutput),
-                      outputHeight: CVPixelBufferGetHeight(proxyOutput))
+                      outputHeight: CVPixelBufferGetHeight(proxyOutput),
+                      proxyCacheHits: (previousWasCached ? 1 : 0) + (currentWasCached ? 1 : 0),
+                      proxyCacheMisses: (previousWasCached ? 0 : 1) + (currentWasCached ? 0 : 1))
+    }
+
+    private func proxyPixelBuffer(from source: CVPixelBuffer,
+                                  presentationTimeStamp: CMTime) throws -> (CVPixelBuffer, Bool) {
+        if isNumeric(presentationTimeStamp),
+           let cacheIndex = proxyCache.firstIndex(where: {
+               CMTimeCompare($0.presentationTimeStamp, presentationTimeStamp) == 0
+           }) {
+            let cached = proxyCache.remove(at: cacheIndex)
+            proxyCache.append(cached)
+            return (cached.pixelBuffer, true)
+        }
+
+        let proxy = try makePixelBuffer(from: source, pool: proxyInputPool)
+        guard isNumeric(presentationTimeStamp) else { return (proxy, false) }
+
+        proxyCache.append(CachedProxyFrame(presentationTimeStamp: presentationTimeStamp,
+                                           pixelBuffer: proxy))
+        if proxyCache.count > proxyCacheCapacity {
+            proxyCache.removeFirst(proxyCache.count - proxyCacheCapacity)
+        }
+        return (proxy, false)
+    }
+
+    private func isNumeric(_ time: CMTime) -> Bool {
+        CMTimeGetSeconds(time).isFinite
     }
 
     private func makePixelBuffer(from source: CVPixelBuffer,
