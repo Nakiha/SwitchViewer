@@ -59,6 +59,8 @@ public final class FullResolutionFrameInterpolator {
     private let computationAccuracy: VNGenerateOpticalFlowRequest.ComputationAccuracy
     private let flowScale: Float
     private let pipeline: MTLComputePipelineState
+    private let bidirectionalLumaPipeline: MTLComputePipelineState
+    private let bidirectionalChromaPipeline: MTLComputePipelineState
     private var textureCache: CVMetalTextureCache?
     private let downscalePipeline: MTLComputePipelineState
     private let blendLumaPipeline: MTLComputePipelineState
@@ -156,6 +158,130 @@ public final class FullResolutionFrameInterpolator {
         output.write(float4(interpolated, 0, 1), gid);
     }
 
+    // Vision indexes each generated flow field in its targeted image: the
+    // forward field is current-frame indexed and the backward field is
+    // previous-frame indexed. Keep those domains straight while mapping both
+    // source images toward the target time.
+    kernel void synthesizeBidirectionalLuma(
+        texture2d<float, access::sample> previous [[texture(0)]],
+        texture2d<float, access::sample> current [[texture(1)]],
+        texture2d<float, access::sample> forwardFlow [[texture(2)]],
+        texture2d<float, access::sample> backwardFlow [[texture(3)]],
+        texture2d<float, access::write> output [[texture(4)]],
+        constant Params &p [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= p.width || gid.y >= p.height) return;
+        constexpr sampler s(address::clamp_to_edge, filter::linear);
+        float2 uv = (float2(gid) + 0.5) / float2(p.width, p.height);
+
+        float2 previousUV = uv;
+        float2 currentUV = uv;
+        for (uint iteration = 0; iteration < 3; ++iteration) {
+            float2 backward = backwardFlow.sample(s, previousUV).rg;
+            float2 forward = forwardFlow.sample(s, currentUV).rg;
+            previousUV = uv + p.phase * sourceCoordinates(previousUV, backward, p);
+            currentUV = uv + (1.0 - p.phase) * sourceCoordinates(currentUV, forward, p);
+        }
+
+        float2 backwardAtPrevious = backwardFlow.sample(s, previousUV).rg;
+        float2 previousToCurrentUV = previousUV
+            - sourceCoordinates(previousUV, backwardAtPrevious, p);
+        float2 forwardAtMappedCurrent = forwardFlow.sample(s, previousToCurrentUV).rg;
+        float previousRoundTripError = length(
+            (sourceCoordinates(previousUV, backwardAtPrevious, p)
+             + sourceCoordinates(previousToCurrentUV, forwardAtMappedCurrent, p))
+            * float2(p.width, p.height));
+
+        float2 forwardAtCurrent = forwardFlow.sample(s, currentUV).rg;
+        float2 currentToPreviousUV = currentUV
+            - sourceCoordinates(currentUV, forwardAtCurrent, p);
+        float2 backwardAtMappedPrevious = backwardFlow.sample(s, currentToPreviousUV).rg;
+        float currentRoundTripError = length(
+            (sourceCoordinates(currentUV, forwardAtCurrent, p)
+             + sourceCoordinates(currentToPreviousUV, backwardAtMappedPrevious, p))
+            * float2(p.width, p.height));
+
+        float previousConfidence = 1.0 - smoothstep(1.5, 7.0, previousRoundTripError);
+        float currentConfidence = 1.0 - smoothstep(1.5, 7.0, currentRoundTripError);
+        bool previousMappedInBounds = all(previousToCurrentUV >= 0.0)
+            && all(previousToCurrentUV <= 1.0);
+        bool currentMappedInBounds = all(currentToPreviousUV >= 0.0)
+            && all(currentToPreviousUV <= 1.0);
+        bool previousSourceInBounds = all(previousUV >= 0.0) && all(previousUV <= 1.0);
+        bool currentSourceInBounds = all(currentUV >= 0.0) && all(currentUV <= 1.0);
+        if (!previousMappedInBounds || !previousSourceInBounds) previousConfidence = 0.0;
+        if (!currentMappedInBounds || !currentSourceInBounds) currentConfidence = 0.0;
+
+        float confidenceSum = previousConfidence + currentConfidence;
+        float currentWeight = confidenceSum > 0.05
+            ? currentConfidence / confidenceSum
+            : (p.phase < 0.5 ? 0.0 : 1.0);
+        float a = previous.sample(s, previousUV).r;
+        float b = current.sample(s, currentUV).r;
+        output.write(float4(mix(a, b, currentWeight), 0, 0, 1), gid);
+    }
+
+    kernel void synthesizeBidirectionalChroma(
+        texture2d<float, access::sample> previous [[texture(0)]],
+        texture2d<float, access::sample> current [[texture(1)]],
+        texture2d<float, access::sample> forwardFlow [[texture(2)]],
+        texture2d<float, access::sample> backwardFlow [[texture(3)]],
+        texture2d<float, access::write> output [[texture(4)]],
+        constant Params &p [[buffer(0)]],
+        uint2 gid [[thread_position_in_grid]]) {
+        uint width = p.width / 2;
+        uint height = p.height / 2;
+        if (gid.x >= width || gid.y >= height) return;
+        constexpr sampler s(address::clamp_to_edge, filter::linear);
+        float2 uv = (float2(gid) + 0.5) / float2(width, height);
+
+        float2 previousUV = uv;
+        float2 currentUV = uv;
+        for (uint iteration = 0; iteration < 3; ++iteration) {
+            float2 backward = backwardFlow.sample(s, previousUV).rg;
+            float2 forward = forwardFlow.sample(s, currentUV).rg;
+            previousUV = uv + p.phase * sourceCoordinates(previousUV, backward, p);
+            currentUV = uv + (1.0 - p.phase) * sourceCoordinates(currentUV, forward, p);
+        }
+
+        float2 backwardAtPrevious = backwardFlow.sample(s, previousUV).rg;
+        float2 previousToCurrentUV = previousUV
+            - sourceCoordinates(previousUV, backwardAtPrevious, p);
+        float2 forwardAtMappedCurrent = forwardFlow.sample(s, previousToCurrentUV).rg;
+        float previousRoundTripError = length(
+            (sourceCoordinates(previousUV, backwardAtPrevious, p)
+             + sourceCoordinates(previousToCurrentUV, forwardAtMappedCurrent, p))
+            * float2(p.width, p.height));
+
+        float2 forwardAtCurrent = forwardFlow.sample(s, currentUV).rg;
+        float2 currentToPreviousUV = currentUV
+            - sourceCoordinates(currentUV, forwardAtCurrent, p);
+        float2 backwardAtMappedPrevious = backwardFlow.sample(s, currentToPreviousUV).rg;
+        float currentRoundTripError = length(
+            (sourceCoordinates(currentUV, forwardAtCurrent, p)
+             + sourceCoordinates(currentToPreviousUV, backwardAtMappedPrevious, p))
+            * float2(p.width, p.height));
+
+        float previousConfidence = 1.0 - smoothstep(1.5, 7.0, previousRoundTripError);
+        float currentConfidence = 1.0 - smoothstep(1.5, 7.0, currentRoundTripError);
+        bool previousMappedInBounds = all(previousToCurrentUV >= 0.0)
+            && all(previousToCurrentUV <= 1.0);
+        bool currentMappedInBounds = all(currentToPreviousUV >= 0.0)
+            && all(currentToPreviousUV <= 1.0);
+        bool previousSourceInBounds = all(previousUV >= 0.0) && all(previousUV <= 1.0);
+        bool currentSourceInBounds = all(currentUV >= 0.0) && all(currentUV <= 1.0);
+        if (!previousMappedInBounds || !previousSourceInBounds) previousConfidence = 0.0;
+        if (!currentMappedInBounds || !currentSourceInBounds) currentConfidence = 0.0;
+
+        float confidenceSum = previousConfidence + currentConfidence;
+        float currentWeight = confidenceSum > 0.05
+            ? currentConfidence / confidenceSum
+            : (p.phase < 0.5 ? 0.0 : 1.0);
+        float2 a = previous.sample(s, previousUV).rg;
+        float2 b = current.sample(s, currentUV).rg;
+        output.write(float4(mix(a, b, currentWeight), 0, 1), gid);
+    }
+
     kernel void blendLuma(
         texture2d<float, access::sample> previous [[texture(0)]],
         texture2d<float, access::sample> current [[texture(1)]],
@@ -217,6 +343,12 @@ public final class FullResolutionFrameInterpolator {
             // The luma and chroma passes use the same kernel signature and parameters.
             self.pipeline = try device.makeComputePipelineState(function: luma)
             self.chromaPipeline = try device.makeComputePipelineState(function: chroma)
+            guard let bidirectionalLuma = library.makeFunction(name: "synthesizeBidirectionalLuma"),
+                  let bidirectionalChroma = library.makeFunction(name: "synthesizeBidirectionalChroma") else {
+                throw InterpolationError.shader("找不到双向光流合成入口")
+            }
+            self.bidirectionalLumaPipeline = try device.makeComputePipelineState(function: bidirectionalLuma)
+            self.bidirectionalChromaPipeline = try device.makeComputePipelineState(function: bidirectionalChroma)
             guard let blendLuma = library.makeFunction(name: "blendLuma"),
                   let blendChroma = library.makeFunction(name: "blendChroma") else {
                 throw InterpolationError.shader("找不到帧混合入口")
@@ -288,20 +420,19 @@ public final class FullResolutionFrameInterpolator {
         let preprocessingMilliseconds = (CFAbsoluteTimeGetCurrent() - preprocessStart) * 1_000
 
         let flowStart = CFAbsoluteTimeGetCurrent()
-        let request = VNGenerateOpticalFlowRequest(targetedCVPixelBuffer: flowInputs.current, options: [:])
-        request.outputPixelFormat = kCVPixelFormatType_TwoComponent16Half
-        request.computationAccuracy = computationAccuracy
-        let handler = VNImageRequestHandler(cvPixelBuffer: flowInputs.previous, options: [:])
-        do {
-            try handler.perform([request])
-        } catch {
-            throw InterpolationError.vision(error.localizedDescription)
+        let forwardFlowBuffer: CVPixelBuffer
+        let backwardFlowBuffer: CVPixelBuffer?
+        if mode == .bidirectionalOpticalFlow {
+            let flows = try estimateBidirectionalFlows(previous: flowInputs.previous,
+                                                       current: flowInputs.current)
+            forwardFlowBuffer = flows.forward
+            backwardFlowBuffer = flows.backward
+        } else {
+            forwardFlowBuffer = try estimateFlow(from: flowInputs.previous, to: flowInputs.current)
+            backwardFlowBuffer = nil
         }
-        guard let flowBuffer = request.results?.first?.pixelBuffer else {
-            throw InterpolationError.vision("请求成功但没有返回光流缓冲")
-        }
-        let flowWidth = CVPixelBufferGetWidth(flowBuffer)
-        let flowHeight = CVPixelBufferGetHeight(flowBuffer)
+        let flowWidth = CVPixelBufferGetWidth(forwardFlowBuffer)
+        let flowHeight = CVPixelBufferGetHeight(forwardFlowBuffer)
         let expectedFlowWidth = CVPixelBufferGetWidth(flowInputs.previous)
         let expectedFlowHeight = CVPixelBufferGetHeight(flowInputs.previous)
         guard flowWidth == expectedFlowWidth, flowHeight == expectedFlowHeight else {
@@ -309,22 +440,57 @@ public final class FullResolutionFrameInterpolator {
                                                     expectedHeight: expectedFlowHeight,
                                                     actualWidth: flowWidth, actualHeight: flowHeight)
         }
-        let centerFlow = try readHalfFlow(flowBuffer, x: flowWidth / 2, y: flowHeight / 2)
+        let centerFlow = try readHalfFlow(forwardFlowBuffer, x: flowWidth / 2, y: flowHeight / 2)
         let flowMilliseconds = (CFAbsoluteTimeGetCurrent() - flowStart) * 1_000
 
         let output = try makeOutput(width: width, height: height, pixelFormat: pixelFormat)
         let synthesisStart = CFAbsoluteTimeGetCurrent()
-        try synthesize(previous: previous, current: current, flow: flowBuffer,
+        try synthesize(previous: previous, current: current, flow: forwardFlowBuffer,
+                       backwardFlow: backwardFlowBuffer,
                        output: output, width: width, height: height,
                        flowWidth: flowWidth, flowHeight: flowHeight, phase: phase,
                        mode: mode)
         let synthesisMilliseconds = (CFAbsoluteTimeGetCurrent() - synthesisStart) * 1_000
-        return Result(pixelBuffer: output, opticalFlowPixelFormat: CVPixelBufferGetPixelFormatType(flowBuffer),
+        return Result(pixelBuffer: output, opticalFlowPixelFormat: CVPixelBufferGetPixelFormatType(forwardFlowBuffer),
                       flowWidth: flowWidth, flowHeight: flowHeight,
                       centerFlowX: centerFlow.x, centerFlowY: centerFlow.y,
                       preprocessingMilliseconds: preprocessingMilliseconds,
                       opticalFlowMilliseconds: flowMilliseconds,
                       synthesisMilliseconds: synthesisMilliseconds)
+    }
+
+    private func estimateFlow(from source: CVPixelBuffer, to target: CVPixelBuffer) throws -> CVPixelBuffer {
+        let request = VNGenerateOpticalFlowRequest(targetedCVPixelBuffer: target, options: [:])
+        request.outputPixelFormat = kCVPixelFormatType_TwoComponent16Half
+        request.computationAccuracy = computationAccuracy
+        do {
+            try VNImageRequestHandler(cvPixelBuffer: source, options: [:]).perform([request])
+        } catch {
+            throw InterpolationError.vision(error.localizedDescription)
+        }
+        guard let flowBuffer = request.results?.first?.pixelBuffer else {
+            throw InterpolationError.vision("请求成功但没有返回光流缓冲")
+        }
+        let expectedWidth = CVPixelBufferGetWidth(target)
+        let expectedHeight = CVPixelBufferGetHeight(target)
+        let actualWidth = CVPixelBufferGetWidth(flowBuffer)
+        let actualHeight = CVPixelBufferGetHeight(flowBuffer)
+        guard actualWidth == expectedWidth, actualHeight == expectedHeight else {
+            throw InterpolationError.flowDimensions(expectedWidth: expectedWidth,
+                                                    expectedHeight: expectedHeight,
+                                                    actualWidth: actualWidth, actualHeight: actualHeight)
+        }
+        return flowBuffer
+    }
+
+    private func estimateBidirectionalFlows(previous: CVPixelBuffer, current: CVPixelBuffer)
+        throws -> (forward: CVPixelBuffer, backward: CVPixelBuffer) {
+        // Vision optical-flow requests are documented as resource-intensive and
+        // should be executed one at a time. Reusing one request also avoids
+        // competing for the same Vision/Metal resources on Apple silicon.
+        let forward = try estimateFlow(from: previous, to: current)
+        let backward = try estimateFlow(from: current, to: previous)
+        return (forward, backward)
     }
 
     private func downscaleFrames(previous: CVPixelBuffer, current: CVPixelBuffer,
@@ -450,9 +616,18 @@ public final class FullResolutionFrameInterpolator {
     }
 
     private func synthesize(previous: CVPixelBuffer, current: CVPixelBuffer, flow: CVPixelBuffer,
+                            backwardFlow: CVPixelBuffer?,
                             output: CVPixelBuffer, width: Int, height: Int,
                             flowWidth: Int, flowHeight: Int, phase: Float,
                             mode: FrameInterpolationMode) throws {
+        if let backwardFlow {
+            try synthesizeBidirectional(previous: previous, current: current,
+                                         forwardFlow: flow, backwardFlow: backwardFlow,
+                                         output: output, width: width, height: height,
+                                         flowWidth: flowWidth, flowHeight: flowHeight,
+                                         phase: phase)
+            return
+        }
         guard let cache = textureCache else { throw InterpolationError.metalTexture("纹理缓存不可用") }
         let previousY = try texture(cache: cache, buffer: previous, format: .r8Unorm,
                                     width: width, height: height, plane: 0)
@@ -497,6 +672,59 @@ public final class FullResolutionFrameInterpolator {
         command.waitUntilCompleted()
         if let error = command.error {
             throw InterpolationError.metalCommand(error.localizedDescription)
+        }
+    }
+
+    private func synthesizeBidirectional(previous: CVPixelBuffer, current: CVPixelBuffer,
+                                         forwardFlow: CVPixelBuffer, backwardFlow: CVPixelBuffer,
+                                         output: CVPixelBuffer, width: Int, height: Int,
+                                         flowWidth: Int, flowHeight: Int, phase: Float) throws {
+        guard let cache = textureCache else { throw InterpolationError.metalTexture("纹理缓存不可用") }
+        let previousY = try texture(cache: cache, buffer: previous, format: .r8Unorm,
+                                    width: width, height: height, plane: 0)
+        let previousUV = try texture(cache: cache, buffer: previous, format: .rg8Unorm,
+                                     width: width / 2, height: height / 2, plane: 1)
+        let currentY = try texture(cache: cache, buffer: current, format: .r8Unorm,
+                                   width: width, height: height, plane: 0)
+        let currentUV = try texture(cache: cache, buffer: current, format: .rg8Unorm,
+                                    width: width / 2, height: height / 2, plane: 1)
+        let forwardTexture = try texture(cache: cache, buffer: forwardFlow, format: .rg16Float,
+                                        width: flowWidth, height: flowHeight, plane: 0)
+        let backwardTexture = try texture(cache: cache, buffer: backwardFlow, format: .rg16Float,
+                                         width: flowWidth, height: flowHeight, plane: 0)
+        let outputY = try texture(cache: cache, buffer: output, format: .r8Unorm,
+                                  width: width, height: height, plane: 0, output: true)
+        let outputUV = try texture(cache: cache, buffer: output, format: .rg8Unorm,
+                                   width: width / 2, height: height / 2, plane: 1, output: true)
+
+        guard let command = queue.makeCommandBuffer() else {
+            throw InterpolationError.metalCommand("无法创建双向光流合成命令缓冲")
+        }
+        var params = Params(width: UInt32(width), height: UInt32(height),
+                            flowWidth: UInt32(flowWidth), flowHeight: UInt32(flowHeight),
+                            phase: phase, vectorScale: 8, mode: 0)
+        let planes: [(MTLComputePipelineState, MTLTexture, MTLTexture, MTLTexture, Int, Int)] = [
+            (bidirectionalLumaPipeline, previousY, currentY, outputY, width, height),
+            (bidirectionalChromaPipeline, previousUV, currentUV, outputUV, width / 2, height / 2)
+        ]
+        for (pipeline, previousPlane, currentPlane, outputPlane, planeWidth, planeHeight) in planes {
+            guard let encoder = command.makeComputeCommandEncoder() else {
+                throw InterpolationError.metalCommand("无法创建双向光流合成编码器")
+            }
+            encoder.setComputePipelineState(pipeline)
+            encoder.setTexture(previousPlane, index: 0)
+            encoder.setTexture(currentPlane, index: 1)
+            encoder.setTexture(forwardTexture, index: 2)
+            encoder.setTexture(backwardTexture, index: 3)
+            encoder.setTexture(outputPlane, index: 4)
+            encoder.setBytes(&params, length: MemoryLayout<Params>.stride, index: 0)
+            dispatch(encoder, width: planeWidth, height: planeHeight, pipeline: pipeline)
+            encoder.endEncoding()
+        }
+        command.commit()
+        command.waitUntilCompleted()
+        if let error = command.error {
+            throw InterpolationError.metalCommand("双向光流合成失败：\(error.localizedDescription)")
         }
     }
 

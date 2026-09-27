@@ -11,6 +11,9 @@ public final class SwitchFrameCadenceDetector {
         public let confidence: Double
         public let cadencePeriod: Int?
         public let repeatedGameFrame: Bool
+        /// Number of capture intervals back to the previous distinct game frame.
+        /// This is only populated for a detected update frame.
+        public let intervalsSincePreviousGameUpdate: Int?
         public let repeatedMotionCoverage: Double
         public let dynamicSampleCount: Int
         /// Mean absolute luma change across the 128x72 sample, normalized to 0...1.
@@ -83,26 +86,56 @@ public final class SwitchFrameCadenceDetector {
         for period in [2, 3] {
             var detectedByPhase = [Int](repeating: 0, count: period)
             var latestRepeatByPhase = [Int](repeating: 0, count: period)
+            var phaseCounts = [Int](repeating: 0, count: period)
+            for intervalIndex in intervals.indices {
+                phaseCounts[intervalIndex % period] += 1
+            }
             var dynamicCount = 0
-            for index in 0..<samples.count {
-                var means = [Double](repeating: 0, count: period)
-                var counts = [Int](repeating: 0, count: period)
+            for sampleIndex in 0..<samples.count {
+                var phase0 = 0.0
+                var phase1 = 0.0
+                var phase2 = 0.0
                 for intervalIndex in intervals.indices {
-                    let phase = intervalIndex % period
-                    means[phase] += Double(intervals[intervalIndex].difference[index])
-                    counts[phase] += 1
+                    let difference = Double(intervals[intervalIndex].difference[sampleIndex])
+                    switch intervalIndex % period {
+                    case 0: phase0 += difference
+                    case 1: phase1 += difference
+                    default: phase2 += difference
+                    }
                 }
-                for phase in 0..<period {
-                    means[phase] /= Double(counts[phase])
+                phase0 /= Double(phaseCounts[0])
+                phase1 /= Double(phaseCounts[1])
+                if period == 3 {
+                    phase2 /= Double(phaseCounts[2])
                 }
-                let maxMotion = means.max() ?? 0
+                let maxMotion = period == 2 ? max(phase0, phase1) : max(phase0, max(phase1, phase2))
                 if maxMotion >= highMotionThreshold { dynamicCount += 1 }
-                guard let repeatPhase = means.indices.min(by: { means[$0] < means[$1] }),
-                      means[repeatPhase] <= lowMotionThreshold else { continue }
-                let changedPhases = means.indices.filter { $0 != repeatPhase }
-                guard changedPhases.allSatisfy({ means[$0] >= highMotionThreshold }) else { continue }
+                var repeatPhase = 0
+                var repeatMean = phase0
+                if phase1 < repeatMean {
+                    repeatPhase = 1
+                    repeatMean = phase1
+                }
+                if period == 3, phase2 < repeatMean {
+                    repeatPhase = 2
+                    repeatMean = phase2
+                }
+                guard repeatMean <= lowMotionThreshold else { continue }
+                let changedPhasesHigh: Bool
+                if period == 2 {
+                    changedPhasesHigh = repeatPhase == 0
+                        ? phase1 >= highMotionThreshold
+                        : phase0 >= highMotionThreshold
+                } else {
+                    switch repeatPhase {
+                    case 0: changedPhasesHigh = phase1 >= highMotionThreshold && phase2 >= highMotionThreshold
+                    case 1: changedPhasesHigh = phase0 >= highMotionThreshold && phase2 >= highMotionThreshold
+                    default: changedPhasesHigh = phase0 >= highMotionThreshold && phase1 >= highMotionThreshold
+                    }
+                }
+                guard changedPhasesHigh else { continue }
                 detectedByPhase[repeatPhase] += 1
-                if Double(intervals[historyLength - 1].difference[index]) <= lowMotionThreshold {
+                if Double(intervals[historyLength - 1].difference[sampleIndex]) <= lowMotionThreshold {
                     latestRepeatByPhase[repeatPhase] += 1
                 }
             }
@@ -132,12 +165,22 @@ public final class SwitchFrameCadenceDetector {
             && coverage >= minimumCoverage
         let latestIntervalRepeatsGame = (historyLength - 1) % candidate.period == candidate.repeatPhase
             && candidate.latestRepeatCount > detectedCount / 2
+        var intervalsSincePreviousGameUpdate: Int?
+        if detected && !latestIntervalRepeatsGame {
+            for index in stride(from: historyLength - 2, through: 0, by: -1) {
+                if index % candidate.period != candidate.repeatPhase {
+                    intervalsSincePreviousGameUpdate = historyLength - 1 - index
+                    break
+                }
+            }
+        }
         return Result(captureFPS: captureFPS,
                       gameFPS: detected
                         ? captureFPS * Double(candidate.period - 1) / Double(candidate.period) : nil,
                       confidence: detected ? confidence : 0,
                       cadencePeriod: detected ? candidate.period : nil,
                       repeatedGameFrame: detected && latestIntervalRepeatsGame,
+                      intervalsSincePreviousGameUpdate: intervalsSincePreviousGameUpdate,
                       repeatedMotionCoverage: detected ? coverage : 0,
                       dynamicSampleCount: dynamicCount,
                       frameDifferenceScore: frameDifferenceScore)
@@ -146,6 +189,7 @@ public final class SwitchFrameCadenceDetector {
     private func unknown(frameDifferenceScore: Double = 0) -> Result {
         Result(captureFPS: nil, gameFPS: nil, confidence: 0,
                cadencePeriod: nil, repeatedGameFrame: false,
+               intervalsSincePreviousGameUpdate: nil,
                repeatedMotionCoverage: 0, dynamicSampleCount: 0,
                frameDifferenceScore: frameDifferenceScore)
     }

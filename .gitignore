@@ -2,3 +2,4 @@
 .DS_Store
 SwitchViewer.app/
 Artifacts/SwitchViewer-pre-*
+Artifacts/*.app/

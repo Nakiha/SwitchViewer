@@ -1,9 +1,11 @@
 import CoreVideo
+import CoreImage
 import Foundation
 import Metal
 import SwitchViewerInterpolation
 import Vision
 import AVFoundation
+import ImageIO
 
 private struct FrameSize {
     let width: Int
@@ -148,6 +150,7 @@ private func meanBlendError(_ first: CVPixelBuffer, _ second: CVPixelBuffer,
 }
 
 private func run(size: FrameSize, repeats: Int, shift: Int, flowScale: Float,
+                 mode: FrameInterpolationMode,
                  engine: FullResolutionFrameInterpolator) throws {
     let previous = try makePatternFrame(size: size, shift: 0)
     let current = try makePatternFrame(size: size, shift: shift)
@@ -157,7 +160,7 @@ private func run(size: FrameSize, repeats: Int, shift: Int, flowScale: Float,
     var renderSamples: [Double] = []
     var result: FullResolutionFrameInterpolator.Result?
     for _ in 0..<repeats {
-        let measured = try engine.interpolate(previous: previous, current: current)
+        let measured = try engine.interpolate(previous: previous, current: current, mode: mode)
         preprocessSamples.append(measured.preprocessingMilliseconds)
         flowSamples.append(measured.opticalFlowMilliseconds)
         renderSamples.append(measured.synthesisMilliseconds)
@@ -174,7 +177,7 @@ private func run(size: FrameSize, repeats: Int, shift: Int, flowScale: Float,
     let flowWidth = result.flowWidth
     let flowHeight = result.flowHeight
     let format = String(result.opticalFlowPixelFormat, radix: 16)
-    print("尺寸：\(size.label)，输入：NV12，Vision 光流：\(flowWidth)×\(flowHeight)，像素格式：0x\(format)")
+    print("模式：\(mode.label)；尺寸：\(size.label)，输入：NV12，Vision 光流：\(flowWidth)×\(flowHeight)，像素格式：0x\(format)")
     print(String(format: "中心光流采样：x=%.3f, y=%.3f；块中心误差：%.1f px（目标约 %.1f px）",
                  result.centerFlowX, result.centerFlowY, centerError, expectedCenter))
     print(String(format: "合成帧对理想中间帧的亮度误差：%.2f；简单叠帧对照误差：%.2f",
@@ -342,10 +345,13 @@ private func analyzeClip(_ path: String) throws {
     var referenceMatches = 0
     var referenceComparisons = 0
     var latest: SwitchFrameCadenceDetector.Result?
+    var cadenceTimings: [Double] = []
     while let sample = output.copyNextSampleBuffer(),
           let pixelBuffer = CMSampleBufferGetImageBuffer(sample) {
         let seconds = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample))
+        let cadenceStart = ProcessInfo.processInfo.systemUptime
         let result = detector.observe(pixelBuffer, presentationTime: seconds)
+        cadenceTimings.append((ProcessInfo.processInfo.systemUptime - cadenceStart) * 1_000)
         if result.gameFPS != nil {
             classified += 1
             if result.repeatedGameFrame { repeated += 1 } else { changed += 1 }
@@ -376,11 +382,272 @@ private func analyzeClip(_ path: String) throws {
                  result.confidence * 100, result.repeatedMotionCoverage * 100,
                  result.repeatedGameFrame ? "是" : "否"))
     print("检测到的重复节奏：\(result.cadencePeriod.map(String.init) ?? "未判定") 个采集间隔为一周期")
+    func percentile(_ values: [Double], _ fraction: Double) -> Double {
+        let sorted = values.sorted()
+        let index = min(sorted.count - 1, max(0, Int(ceil(Double(sorted.count) * fraction)) - 1))
+        return sorted[index]
+    }
+    print(String(format: "逐帧节奏检测耗时：P50 %.2fms / P95 %.2fms（%d帧）",
+                 percentile(cadenceTimings, 0.50), percentile(cadenceTimings, 0.95), cadenceTimings.count))
+}
+
+private func readClipFramePair(_ clipPath: String, previousFrameIndex: Int,
+                               currentFrameIndex: Int) throws -> (CVPixelBuffer, CVPixelBuffer, CMTime, CMTime) {
+    let url = URL(fileURLWithPath: clipPath)
+    let asset = AVURLAsset(url: url)
+    guard let track = asset.tracks(withMediaType: .video).first else {
+        throw NSError(domain: "FrameInterpolationLab", code: 31,
+                      userInfo: [NSLocalizedDescriptionKey: "采集样本没有视频轨道"])
+    }
+    let reader = try AVAssetReader(asset: asset)
+    let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
+        kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    ])
+    output.alwaysCopiesSampleData = false
+    guard reader.canAdd(output) else {
+        throw NSError(domain: "FrameInterpolationLab", code: 32,
+                      userInfo: [NSLocalizedDescriptionKey: "无法解码采集样本"])
+    }
+    reader.add(output)
+    guard reader.startReading() else {
+        throw reader.error ?? NSError(domain: "FrameInterpolationLab", code: 33)
+    }
+
+    var previous: CVPixelBuffer?
+    var current: CVPixelBuffer?
+    var previousTime = CMTime.invalid
+    var currentTime = CMTime.invalid
+    var frameIndex = 0
+    while let sample = output.copyNextSampleBuffer() {
+        if frameIndex == previousFrameIndex, let buffer = CMSampleBufferGetImageBuffer(sample) {
+            previous = buffer
+            previousTime = CMSampleBufferGetPresentationTimeStamp(sample)
+        }
+        if frameIndex == currentFrameIndex, let buffer = CMSampleBufferGetImageBuffer(sample) {
+            current = buffer
+            currentTime = CMSampleBufferGetPresentationTimeStamp(sample)
+            break
+        }
+        frameIndex += 1
+    }
+    guard let previous, let current else {
+        throw NSError(domain: "FrameInterpolationLab", code: 34,
+                      userInfo: [NSLocalizedDescriptionKey: "样本中没有所选帧；可用 --apple-*-frames=上一帧,当前帧 调整帧号"])
+    }
+    return (previous, current, previousTime, currentTime)
+}
+
+private func runAppleTiledProbe(clipPath: String, previousFrameIndex: Int = 169,
+                                currentFrameIndex: Int = 171,
+                                sessionCount: Int = 4) throws {
+    guard #available(macOS 26.0, *) else {
+        throw NSError(domain: "FrameInterpolationLab", code: 30,
+                      userInfo: [NSLocalizedDescriptionKey: "Apple 低延迟插帧需要 macOS 26 或更新版本"])
+    }
+    let (previous, current, previousTime, currentTime) = try readClipFramePair(
+        clipPath, previousFrameIndex: previousFrameIndex, currentFrameIndex: currentFrameIndex)
+    let width = CVPixelBufferGetWidth(current)
+    let height = CVPixelBufferGetHeight(current)
+    guard width == 3840, height == 2160 else {
+        throw NSError(domain: "FrameInterpolationLab", code: 35,
+                      userInfo: [NSLocalizedDescriptionKey: "分块探针要求 3840×2160 样本，实际为 \(width)×\(height)"])
+    }
+
+    let interpolator = try AppleTiledFrameInterpolator(width: width, height: height,
+                                                       pixelFormat: CVPixelBufferGetPixelFormatType(current),
+                                                       maxConcurrentSessions: sessionCount)
+    print("VTFrameProcessor 会话依次启动耗时：" + interpolator.sessionStartMilliseconds.enumerated().map {
+        String(format: "#%d %.1fms", $0.offset + 1, $0.element)
+    }.joined(separator: "，"))
+    let warmup = try interpolator.interpolate(previous: previous, current: current,
+                                              previousPresentationTimeStamp: previousTime,
+                                              currentPresentationTimeStamp: currentTime)
+    let interval = CMTimeSubtract(currentTime, previousTime)
+    var measuredRuns: [AppleTiledFrameInterpolator.Result] = []
+    for run in 0..<5 {
+        let offset = Int32((run + 1) * 2)
+        let runPreviousTime = CMTimeAdd(previousTime, CMTimeMultiply(interval, multiplier: offset))
+        let runCurrentTime = CMTimeAdd(currentTime, CMTimeMultiply(interval, multiplier: offset))
+        measuredRuns.append(try interpolator.interpolate(previous: previous, current: current,
+                                                         previousPresentationTimeStamp: runPreviousTime,
+                                                         currentPresentationTimeStamp: runCurrentTime))
+    }
+    let measured = measuredRuns[measuredRuns.count - 1]
+    func median(_ values: [Double]) -> Double {
+        values.sorted()[values.count / 2]
+    }
+    print("Apple 分块插帧：\(width)×\(height) NV12，2×2 个 1920×1080 tiles，并行会话=\(measured.concurrentSessionCount)")
+    print(String(format: "真实采集帧 %d→%d；首次耗时 %.1f ms；后续 5 次中位数 %.1f ms（准备 %.1f / Apple %.1f / 拼接 %.1f）；合成帧输出 %d×%d；tile 数=%d",
+                 previousFrameIndex, currentFrameIndex,
+                 warmup.processingMilliseconds,
+                 median(measuredRuns.map(\.processingMilliseconds)),
+                 median(measuredRuns.map(\.preparationMilliseconds)),
+                 median(measuredRuns.map(\.processorMilliseconds)),
+                 median(measuredRuns.map(\.stitchingMilliseconds)),
+                 CVPixelBufferGetWidth(measured.pixelBuffer), CVPixelBufferGetHeight(measured.pixelBuffer),
+                 measured.tileCount))
+    print("五次处理分段（准备 / VideoToolbox 请求到回调阶段 / 拼接，ms）：" +
+          measuredRuns.enumerated().map { index, result in
+              String(format: "#%d %.1f / %.1f / %.1f", index + 1,
+                     result.preparationMilliseconds, result.processorMilliseconds,
+                     result.stitchingMilliseconds)
+          }.joined(separator: "；"))
+    print("最后一次各路请求时间线（起始偏移 / process 调用耗时 / 请求至回调耗时 / 回调偏移，ms；回调耗时不等于纯 GPU 执行时间）：")
+    for timing in measured.tileTimings {
+        print(String(format: "tile %d → session %d：%.2f / %.2f / %.2f / %.2f",
+                     timing.tileIndex + 1, timing.processorIndex + 1,
+                     timing.requestStartOffsetMilliseconds, timing.processCallMilliseconds,
+                     timing.callbackLatencyMilliseconds, timing.completionOffsetMilliseconds))
+    }
+    func printSamples(_ buffer: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return }
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        let bufferWidth = CVPixelBufferGetWidth(buffer)
+        let bufferHeight = CVPixelBufferGetHeight(buffer)
+        for (name, x, y) in [("左上", bufferWidth / 4, bufferHeight / 4),
+                             ("右上", bufferWidth * 3 / 4, bufferHeight / 4),
+                             ("左下", bufferWidth / 4, bufferHeight * 3 / 4),
+                             ("右下", bufferWidth * 3 / 4, bufferHeight * 3 / 4)] {
+            let luma = yBase.advanced(by: y * yStride + x).assumingMemoryBound(to: UInt8.self).pointee
+            let chroma = uvBase.advanced(by: (y / 2) * uvStride + x).assumingMemoryBound(to: UInt8.self)
+            print("\(name)：Y=\(luma)，UV=\(chroma[0]),\(chroma[1])")
+        }
+    }
+    print("合成帧四象限中心采样：")
+    printSamples(measured.pixelBuffer)
+
+    let imageURL = try writeProbeImage(measured.pixelBuffer,
+                                       path: "/tmp/SwitchViewer-apple-tiled-midpoint.png")
+    print("合成帧截图：\(imageURL.path)")
+}
+
+private func runAppleDownsampleProbe(clipPath: String, previousFrameIndex: Int = 169,
+                                     currentFrameIndex: Int = 171) throws {
+    guard #available(macOS 26.0, *) else {
+        throw NSError(domain: "FrameInterpolationLab", code: 50,
+                      userInfo: [NSLocalizedDescriptionKey: "Apple 低延迟插帧需要 macOS 26 或更新版本"])
+    }
+    let (previous, current, previousTime, currentTime) = try readClipFramePair(
+        clipPath, previousFrameIndex: previousFrameIndex, currentFrameIndex: currentFrameIndex)
+    let interpolator = try AppleDownsampledFrameInterpolator(
+        width: CVPixelBufferGetWidth(current), height: CVPixelBufferGetHeight(current),
+        pixelFormat: CVPixelBufferGetPixelFormatType(current))
+    let warmup = try interpolator.interpolate(previous: previous, current: current,
+                                              previousPresentationTimeStamp: previousTime,
+                                              currentPresentationTimeStamp: currentTime)
+    let interval = CMTimeSubtract(currentTime, previousTime)
+    var measuredRuns: [AppleDownsampledFrameInterpolator.Result] = []
+    for run in 0..<5 {
+        let offset = Int32((run + 1) * 2)
+        measuredRuns.append(try interpolator.interpolate(
+            previous: previous, current: current,
+            previousPresentationTimeStamp: CMTimeAdd(previousTime, CMTimeMultiply(interval, multiplier: offset)),
+            currentPresentationTimeStamp: CMTimeAdd(currentTime, CMTimeMultiply(interval, multiplier: offset))))
+    }
+    let measured = measuredRuns[measuredRuns.count - 1]
+    func median(_ values: [Double]) -> Double { values.sorted()[values.count / 2] }
+    print("Apple 全画面 1080p 代理插帧：源 3840×2160 → Metal NV12 盒式缩小 → Apple 插帧 → Catmull-Rom 放大回 4K")
+    print(String(format: "真实采集帧 %d→%d；首次 %.1f ms；后续 5 次中位数 %.1f ms（缩放 %.1f / Apple %.1f）；输出 %d×%d",
+                 previousFrameIndex, currentFrameIndex, warmup.processingMilliseconds,
+                 median(measuredRuns.map(\.processingMilliseconds)),
+                 median(measuredRuns.map(\.resizeMilliseconds)),
+                 median(measuredRuns.map(\.processorMilliseconds)),
+                 measured.outputWidth, measured.outputHeight))
+    func printColorRangeStats(_ label: String, _ buffer: CVPixelBuffer) {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 0),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(buffer, 1) else { return }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(buffer, 1)
+        let y = yBase.assumingMemoryBound(to: UInt8.self)
+        let uv = uvBase.assumingMemoryBound(to: UInt8.self)
+        var ySum = UInt64(0), uSum = UInt64(0), vSum = UInt64(0)
+        for row in 0..<height {
+            for column in 0..<width { ySum += UInt64(y[row * yStride + column]) }
+        }
+        for row in 0..<(height / 2) {
+            for column in stride(from: 0, to: width, by: 2) {
+                uSum += UInt64(uv[row * uvStride + column])
+                vSum += UInt64(uv[row * uvStride + column + 1])
+            }
+        }
+        let pixelCount = Double(width * height)
+        print(String(format: "%@ 全帧均值：Y=%.1f U=%.1f V=%.1f",
+                     label, Double(ySum) / pixelCount,
+                     Double(uSum) / (pixelCount / 4), Double(vSum) / (pixelCount / 4)))
+    }
+    printColorRangeStats("原始4K", current)
+    printColorRangeStats("代理插帧回4K", measured.pixelBuffer)
+    let imageURL = try writeProbeImage(measured.pixelBuffer,
+                                       path: "/tmp/SwitchViewer-apple-downsampled-4k-midpoint.png")
+    let sourceURL = try writeProbeImage(current,
+                                        path: "/tmp/SwitchViewer-apple-downsampled-source.png")
+    print("合成帧截图：\(imageURL.path)")
+    print("原始 4K 帧截图：\(sourceURL.path)")
+}
+
+private func writeProbeImage(_ buffer: CVPixelBuffer, path: String) throws -> URL {
+    guard let device = MTLCreateSystemDefaultDevice() else {
+        throw NSError(domain: "FrameInterpolationLab", code: 60,
+                      userInfo: [NSLocalizedDescriptionKey: "没有 Metal GPU，不能导出探针画面"])
+    }
+    let context = CIContext(mtlDevice: device)
+    let image = CIImage(cvPixelBuffer: buffer)
+    guard let cgImage = context.createCGImage(image, from: image.extent) else {
+        throw NSError(domain: "FrameInterpolationLab", code: 61,
+                      userInfo: [NSLocalizedDescriptionKey: "无法将插帧结果转换为 PNG"])
+    }
+    let imageURL = URL(fileURLWithPath: path)
+    guard let destination = CGImageDestinationCreateWithURL(imageURL as CFURL,
+                                                             "public.png" as CFString, 1, nil) else {
+        throw NSError(domain: "FrameInterpolationLab", code: 62,
+                      userInfo: [NSLocalizedDescriptionKey: "创建 PNG 探针输出失败"])
+    }
+    CGImageDestinationAddImage(destination, cgImage, nil)
+    guard CGImageDestinationFinalize(destination) else {
+        throw NSError(domain: "FrameInterpolationLab", code: 63,
+                      userInfo: [NSLocalizedDescriptionKey: "写入 PNG 探针输出失败"])
+    }
+    return imageURL
 }
 
 do {
     let args = Array(CommandLine.arguments.dropFirst())
     let arguments = Set(args)
+    if let probeArgument = args.first(where: { $0.hasPrefix("--apple-downsample-probe=") }) {
+        let path = String(probeArgument.split(separator: "=", maxSplits: 1).last ?? "")
+        let framePair = args.first(where: { $0.hasPrefix("--apple-downsample-frames=") })?
+            .split(separator: "=", maxSplits: 1).last.map(String.init) ?? "169,171"
+        let pair = framePair.split(separator: ",").compactMap { Int($0) }
+        guard pair.count == 2 else {
+            throw NSError(domain: "FrameInterpolationLab", code: 64,
+                          userInfo: [NSLocalizedDescriptionKey: "--apple-downsample-frames 格式应为 上一帧,当前帧"])
+        }
+        try runAppleDownsampleProbe(clipPath: path, previousFrameIndex: pair[0], currentFrameIndex: pair[1])
+        exit(0)
+    }
+    if let probeArgument = args.first(where: { $0.hasPrefix("--apple-tiled-probe=") }) {
+        let path = String(probeArgument.split(separator: "=", maxSplits: 1).last ?? "")
+        let framePair = args.first(where: { $0.hasPrefix("--apple-tiled-frames=") })?
+            .split(separator: "=", maxSplits: 1).last.map(String.init) ?? "169,171"
+        let sessions = Int(args.first(where: { $0.hasPrefix("--apple-tiled-sessions=") })?
+            .split(separator: "=", maxSplits: 1).last ?? "4") ?? 4
+        let pair = framePair.split(separator: ",").compactMap { Int($0) }
+        guard pair.count == 2 else {
+            throw NSError(domain: "FrameInterpolationLab", code: 40,
+                          userInfo: [NSLocalizedDescriptionKey: "--apple-tiled-frames 格式应为 上一帧,当前帧"])
+        }
+        try runAppleTiledProbe(clipPath: path, previousFrameIndex: pair[0],
+                               currentFrameIndex: pair[1], sessionCount: sessions)
+        exit(0)
+    }
     let requestedRepeats = Int(args.first(where: { $0.hasPrefix("--repeats=") })?
         .split(separator: "=").last ?? "3") ?? 3
     let repeats = arguments.contains("--quick") ? 1 : max(1, requestedRepeats)
@@ -388,6 +655,8 @@ do {
         .split(separator: "=").last ?? "16") ?? 16
     let flowScale = Float(args.first(where: { $0.hasPrefix("--flow-scale=") })?
         .split(separator: "=").last ?? "1") ?? 1
+    let interpolationMode: FrameInterpolationMode = arguments.contains("--bidirectional")
+        ? .bidirectionalOpticalFlow : .opticalFlow
     if let clipArgument = args.first(where: { $0.hasPrefix("--analyze-clip=") }) {
         try analyzeClip(String(clipArgument.split(separator: "=", maxSplits: 1).last ?? ""))
         try runSyntheticCadenceTest(gameFPS: 30)
@@ -412,15 +681,15 @@ do {
                                                      flowScale: flowScale)
     if arguments.contains("--4k-only") {
         try run(size: FrameSize(width: 3840, height: 2160), repeats: repeats,
-                shift: shift, flowScale: flowScale, engine: engine)
+                shift: shift, flowScale: flowScale, mode: interpolationMode, engine: engine)
     } else if arguments.contains("--1080p-only") {
         try run(size: FrameSize(width: 1920, height: 1080), repeats: repeats,
-                shift: shift, flowScale: flowScale, engine: engine)
+                shift: shift, flowScale: flowScale, mode: interpolationMode, engine: engine)
     } else {
         try run(size: FrameSize(width: 1920, height: 1080), repeats: repeats,
-                shift: shift, flowScale: flowScale, engine: engine)
+                shift: shift, flowScale: flowScale, mode: interpolationMode, engine: engine)
         try run(size: FrameSize(width: 3840, height: 2160), repeats: repeats,
-                shift: shift, flowScale: flowScale, engine: engine)
+                shift: shift, flowScale: flowScale, mode: interpolationMode, engine: engine)
     }
 } catch {
     fputs("探针失败：\(error)\n", stderr)
