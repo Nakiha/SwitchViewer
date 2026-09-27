@@ -183,3 +183,9 @@
 - Apple 4K 代理插帧每轮会分别把前后两张 3840×2160 NV12 输入缩到 1920×1080，而且每次 Metal 缩放都会同步等待 GPU。连续游戏帧的上一张输入，通常正是上一轮已经缩好的当前帧。
 - 增加最多 4 张的代理缓冲 LRU 缓存，以媒体时间戳查找，缓存只保留 1080p 像素缓冲，不持有原始 4K 采集缓冲。时间戳倒退时清空缓存；无效时间戳不缓存。常见稳态预计每轮从两次缩放降为一次，日志新增 `proxyCache=命中数/未命中数` 用来核实实际命中率。
 - Release 构建成功，新的 `SwitchViewer.app` 已安装并通过严格签名校验；替换前的 app bundle 保存在 `Artifacts/SwitchViewer-running-old-proxy-cache-20260928.app`。进程 PID 82786 是替换前启动的旧实例，仍在运行，因此新缓存尚未实测；退出并重新打开后，比较 `preprocess`、`provider`、`captureToReady` 和 `proxyCache` 日志。
+
+## 2026-09-28：采集回调优先级与交付时延测量
+
+- 当前进程的 20 个三秒窗口显示，采集时间戳到上屏与采集回调到上屏的 P50 差约 28ms；但此前没有逐帧记录“采集 PTS→delegate 回调”，无法判断这段差值在 CoreMediaIO 交付还是样本处理。
+- 将 `AVCaptureVideoDataOutput` delegate 使用的串行 `framesQueue` 提升到 `.userInteractive`，并新增每三秒的 `ptsToCallback` 与 `callbackWork` P50/P95 统计。插帧算法、输入尺寸、呈现队列和按节奏 pacing 均未改。
+- Release 构建成功，新版 app 已安装并通过严格签名校验。PID 84403 仍运行缓存版旧代码；退出并重开后检查启动日志中的 `captureCallbackQueueQoS=userInteractive`，再比较 PTS→回调、回调处理耗时以及 callback→display。更新前 app bundle 保存在 `Artifacts/SwitchViewer-running-pre-capture-qos-20260928.app`。

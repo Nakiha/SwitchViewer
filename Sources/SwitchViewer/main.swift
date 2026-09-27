@@ -1187,7 +1187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var formatOptions: [FormatOption] = []
 
     // 帧统计（截图 + 诊断 + fps 用）
-    let framesQueue = DispatchQueue(label: "switchviewer.frames")
+    let framesQueue = DispatchQueue(label: "switchviewer.frames", qos: .userInteractive)
     let frameLock = NSLock()
     var frameCount = 0 // Metal 渲染成功的帧（watchdog 与 fps 只看它）
     var droppedCount = 0
@@ -1231,6 +1231,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let displayTimingQueue = DispatchQueue(label: "switchviewer.display-timing")
     private var displayTimingSamples: [DisplayLatencySample] = []
     private var lastDisplayTimingReportUptime = ProcessInfo.processInfo.systemUptime
+    private struct CaptureCallbackTimingSample {
+        let ptsToCallbackMilliseconds: Double?
+        let callbackWorkMilliseconds: Double
+    }
+    private let captureCallbackTimingQueue = DispatchQueue(label: "switchviewer.capture-callback-timing")
+    private var captureCallbackTimingSamples: [CaptureCallbackTimingSample] = []
+    private var lastCaptureCallbackTimingReportUptime = ProcessInfo.processInfo.systemUptime
     private let captureDisplayAwakeAssertion = CaptureDisplayAwakeAssertion()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1250,7 +1257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             enableFallback("Metal 初始化失败：\(metalInitError ?? "?")")
         }
         diagnosticLog.append("Metal 初始化; result=\(metalInitError ?? "OK"); selfTest=\(metalSelfTest ?? "通过")")
-        diagnosticLog.append("低延迟呈现队列; maximumDrawableCount=\(maximumPresentationInFlightFrames); inFlightLimit=\(maximumPresentationInFlightFrames); presentationPacing=\(presentationPacingMode.label); exactSourceDedupe=fullNV12")
+        diagnosticLog.append("低延迟呈现队列; maximumDrawableCount=\(maximumPresentationInFlightFrames); inFlightLimit=\(maximumPresentationInFlightFrames); presentationPacing=\(presentationPacingMode.label); captureCallbackQueueQoS=userInteractive; exactSourceDedupe=fullNV12")
         refreshDevices(selectPreferred: true)
         NotificationCenter.default.addObserver(self, selector: #selector(deviceDisconnected(_:)),
                                                name: .AVCaptureDeviceWasDisconnected, object: nil)
@@ -2479,12 +2486,53 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
     }
 
+    private func recordCaptureCallbackTiming(ptsToCallbackMilliseconds: Double?,
+                                             callbackWorkMilliseconds: Double) {
+        captureCallbackTimingQueue.async {
+            self.captureCallbackTimingSamples.append(CaptureCallbackTimingSample(
+                ptsToCallbackMilliseconds: ptsToCallbackMilliseconds,
+                callbackWorkMilliseconds: callbackWorkMilliseconds))
+            let now = ProcessInfo.processInfo.systemUptime
+            guard now - self.lastCaptureCallbackTimingReportUptime >= 3,
+                  !self.captureCallbackTimingSamples.isEmpty else { return }
+            let samples = self.captureCallbackTimingSamples
+            self.captureCallbackTimingSamples.removeAll(keepingCapacity: true)
+            self.lastCaptureCallbackTimingReportUptime = now
+
+            func percentile(_ values: [Double], _ fraction: Double) -> Double? {
+                guard !values.isEmpty else { return nil }
+                let sorted = values.sorted()
+                let index = min(sorted.count - 1,
+                                max(0, Int(ceil(Double(sorted.count) * fraction)) - 1))
+                return sorted[index]
+            }
+            func range(_ values: [Double]) -> String {
+                guard let p50 = percentile(values, 0.50),
+                      let p95 = percentile(values, 0.95) else { return "无" }
+                return String(format: "%.1f/%.1f", p50, p95)
+            }
+            self.diagnosticLog.append(
+                "采集回调耗时 P50/P95 ms; samples=\(samples.count); ptsToCallback=\(range(samples.compactMap(\.ptsToCallbackMilliseconds))); callbackWork=\(range(samples.map(\.callbackWorkMilliseconds)))")
+        }
+    }
+
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        let callbackWorkStart = ProcessInfo.processInfo.systemUptime
+        var ptsToCallbackMilliseconds: Double?
+        defer {
+            let callbackWorkMilliseconds = (ProcessInfo.processInfo.systemUptime - callbackWorkStart) * 1_000
+            recordCaptureCallbackTiming(ptsToCallbackMilliseconds: ptsToCallbackMilliseconds,
+                                        callbackWorkMilliseconds: callbackWorkMilliseconds)
+        }
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let captureCallbackHostTime = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
         let presentationTimestampHostTime = hostTime(forCaptureTimestamp: presentationTimeStamp)
+        if let presentationTimestampHostTime,
+           captureCallbackHostTime >= presentationTimestampHostTime {
+            ptsToCallbackMilliseconds = (captureCallbackHostTime - presentationTimestampHostTime) * 1_000
+        }
         let pf = CVPixelBufferGetPixelFormatType(pb)
         frameLock.lock()
         let changed = lastWidth != CVPixelBufferGetWidth(pb)
