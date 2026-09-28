@@ -238,3 +238,10 @@
 - 同一实验版在切到 deadline 前的短基线（20:48:28–20:48:54）中，去掉启动首个异常窗口后，插值帧 callback→display 的 3 秒窗口 P50/P95 中位数为 41.1/49.2ms（5 窗口），采集帧为 57.5/58.1ms（7 窗口）。21:02:55–21:03:22 的实验模式分别为 48.0/56.1ms、64.8/73.7ms（各 10 窗口）。时间段和内容并非严格锁定的即时 A/B，但未显示时延下降，符合 reset/95ms 目标偏保守的判断。
 - 完整 reset 的 playout 初值从 95ms 降至 75ms；现有 ready-time P99 估计仍可按实测需要上调。30fps 检测短暂 unknown 时保留 scheduler 路由最多 18 个连续采集样本（约 300ms），期间照常排 source slot；检测器没有给出有效 cadence 时不会生成 midpoint。若 unknown 持续到阈值，或明确识别到其他游戏节奏，再取消 pending slot/更换 epoch，并保留已学到的 playout、renderer lead 和 wake timing；格式、模式或采集会话重配仍执行完整清理。
 - Release 构建通过；只有原有 AVCaptureDevice.devices(for:) 弃用警告。新包 `.build/SwitchViewer-Deadline-Experiment-v2.app` 独立打包并通过严格签名校验，未替换或重启仍在运行的 v1。v2 硬件 A/B 尚待重开后执行；审计提出的 50–55ms 和 callback-anchored 调度未直接采用，需用中间帧迟到率和同场 A/B 验证其 tradeoff。
+
+## 2026-09-28：v2 VideoToolbox 崩溃与 scheduler 抖动加固
+
+- 用户提供的 v2 崩溃报告显示，运行约 36 分钟后，`VTFrameProcessor.processWithCommandBuffer:parameters:` 在 VideoToolbox 内因 `NSMutableArray insertObject:nil` 触发 `SIGABRT`。崩溃前 4K60、30fps 代理插帧、Metal 与渲染指标正常；报告不能证明 VideoToolbox 收到的具体内部对象为何为 nil，也没有证据把崩溃归因给 deadline scheduler。
+- 单改回“按检测节奏限速”不能避开该调用：旧节奏和 deadline 节奏共用 4K 代理插帧器；之前的异步实现也走同一个 `process(with:parameters:)` selector。为避开已知崩溃入口，代理缩放 command buffer 先完成，再调用 VideoToolbox 的独立异步 completion-handler 接口；另加非递增、无效或间隔大于等于 1 秒的时间戳检查，遇到时跳过插值并记录 PTS。
+- v2 长跑日志还显示 cadence unknown/30fps 反复切换，在约 2.5 分钟内发生 5 次 scheduler reset，含 4 秒内 3 次的簇。unknown 宽限增至 60 个采集样本，并要求连续 8 帧识别为 30fps 才重新启用 scheduler。
+- `swift build -c release` 成功；只见现有 AVFoundation 与 FrameInterpolationLab 的弃用警告。独立 v3 app `.build/SwitchViewer-Deadline-Experiment-v3.app` 已通过 strict signature 校验。当前未连接实机长跑验证；接下来重点观察崩溃是否消失、`separateProcessorSubmission` 耗时与 cadence reset 频率。

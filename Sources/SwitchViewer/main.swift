@@ -609,7 +609,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let captureToReadyMilliseconds: Double
         let proxyCacheHits: Int
         let proxyCacheMisses: Int
-        let usedSplitFallback: Bool
+        let usedSeparateProcessorSubmission: Bool
     }
 
     private let queue = DispatchQueue(label: "switchviewer.frame-interpolation")
@@ -814,6 +814,16 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let halfInterval = CMTimeGetSeconds(interval) / 2
         let frameDuration = halfInterval.isFinite && halfInterval > 0 && halfInterval < 0.5
             ? halfInterval : nil
+        guard let frameDuration else {
+            let previousSeconds = CMTimeGetSeconds(previousPresentationTimeStamp)
+            let currentSeconds = CMTimeGetSeconds(input.presentationTimeStamp)
+            onTimingReport("插帧输入跳过; 原因=时间戳非递增或间隔超出 1 秒; "
+                           + String(format: "previousPTS=%.6f; currentPTS=%.6f",
+                                    previousSeconds, currentSeconds))
+            input.completion(nil, nil, nil)
+            processNext()
+            return
+        }
 
         let selectedMode = mode
         if selectedMode == .appleLowLatency,
@@ -889,7 +899,8 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                                          - input.submittedAtUptime) * 1_000,
                             proxyCacheHits: result?.proxyCacheHits ?? 0,
                             proxyCacheMisses: result?.proxyCacheMisses ?? 0,
-                            usedSplitFallback: result?.usedSplitFallback ?? false))
+                            usedSeparateProcessorSubmission:
+                                result?.usedSeparateProcessorSubmission ?? false))
                         if let errorMessage {
                             self.processingDisabledError = errorMessage
                             input.completion(nil, errorMessage, nil)
@@ -965,7 +976,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                                      - input.submittedAtUptime) * 1_000,
                         proxyCacheHits: 0,
                         proxyCacheMisses: 0,
-                        usedSplitFallback: false))
+                        usedSeparateProcessorSubmission: false))
                     if let errorMessage {
                         self.processingDisabledError = errorMessage
                         input.completion(nil, errorMessage, nil)
@@ -1042,7 +1053,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                                  - input.submittedAtUptime) * 1_000,
                     proxyCacheHits: 0,
                     proxyCacheMisses: 0,
-                    usedSplitFallback: false))
+                    usedSeparateProcessorSubmission: false))
                 let halfInterval = CMTimeGetSeconds(interval) / 2
                 let frameDuration = halfInterval.isFinite && halfInterval > 0 && halfInterval < 0.5
                     ? halfInterval : nil
@@ -1112,8 +1123,8 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             }
             let proxyCacheHits = values.reduce(0) { $0 + $1.proxyCacheHits }
             let proxyCacheMisses = values.reduce(0) { $0 + $1.proxyCacheMisses }
-            let splitFallbacks = values.filter(\.usedSplitFallback).count
-            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); proxyEncodeCPU=\(range(\.preprocessingMilliseconds)); commandBufferQueueWait=\(range(\.commandBufferQueueWaitMilliseconds)); commandBufferGPU=\(range(\.commandBufferGPUExecutionMilliseconds)); commandBufferCommitToComplete=\(range(\.commandBufferCommitToCompleteMilliseconds)); proxyCache=\(proxyCacheHits)/\(proxyCacheMisses); splitFallback=\(splitFallbacks); interpolationSubmitToReady=\(range(\.interpolationSubmitToReadyMilliseconds)); appleOrCombined=\(range(\.appleOrCombinedProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
+            let separateProcessorSubmissions = values.filter(\.usedSeparateProcessorSubmission).count
+            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); proxyEncodeCPU=\(range(\.preprocessingMilliseconds)); commandBufferQueueWait=\(range(\.commandBufferQueueWaitMilliseconds)); commandBufferGPU=\(range(\.commandBufferGPUExecutionMilliseconds)); commandBufferCommitToComplete=\(range(\.commandBufferCommitToCompleteMilliseconds)); proxyCache=\(proxyCacheHits)/\(proxyCacheMisses); separateProcessorSubmission=\(separateProcessorSubmissions)/\(values.count); interpolationSubmitToReady=\(range(\.interpolationSubmitToReadyMilliseconds)); appleOrCombined=\(range(\.appleOrCombinedProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
         }
         timingSamples.removeAll(keepingCapacity: true)
     }
@@ -1293,7 +1304,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var detectedGameFPS: Double?
     var deadlineCadenceActive = false
     var consecutiveNonDeadlineCadenceFrames = 0
-    private let deadlineCadenceLossGraceFrames = 18
+    var consecutiveDeadlineCadenceFrames = 0
+    private let deadlineCadenceLossGraceFrames = 60
+    private let deadlineCadenceRecoveryFrames = 8
     var nextSourceFrameID: UInt64 = 0
     lazy var presentationScheduler = PresentationScheduler(
         onFrame: { [weak self] frame, epoch in
@@ -1326,6 +1339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func clearDeadlineCadenceQualificationLocked() {
         deadlineCadenceActive = false
         consecutiveNonDeadlineCadenceFrames = 0
+        consecutiveDeadlineCadenceFrames = 0
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -2319,9 +2333,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         if !schedulerSelected {
                             self.clearDeadlineCadenceQualificationLocked()
                         } else if isDeadlineCadence {
-                            self.deadlineCadenceActive = true
                             self.consecutiveNonDeadlineCadenceFrames = 0
+                            if self.deadlineCadenceActive {
+                                self.consecutiveDeadlineCadenceFrames = 0
+                            } else {
+                                self.consecutiveDeadlineCadenceFrames += 1
+                                if self.consecutiveDeadlineCadenceFrames
+                                    >= self.deadlineCadenceRecoveryFrames {
+                                    self.deadlineCadenceActive = true
+                                    self.consecutiveDeadlineCadenceFrames = 0
+                                }
+                            }
                         } else if self.deadlineCadenceActive {
+                            self.consecutiveDeadlineCadenceFrames = 0
                             if gameFPS == nil {
                                 self.consecutiveNonDeadlineCadenceFrames += 1
                                 if self.consecutiveNonDeadlineCadenceFrames
@@ -2339,6 +2363,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                                 let cadenceLabel = gameFPS.map { String(format: "%.1f", $0) } ?? "未知"
                                 schedulerResetReason = "检测到非 30fps 节奏 \(cadenceLabel)"
                             }
+                        } else {
+                            self.consecutiveNonDeadlineCadenceFrames = 0
+                            self.consecutiveDeadlineCadenceFrames = 0
                         }
                         if shouldResetScheduler { self.frameInterpolationEpoch += 1 }
                         let schedulerEpoch = self.frameInterpolationEpoch
