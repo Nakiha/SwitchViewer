@@ -223,3 +223,11 @@
 - 呈现目标用 `present(drawable, atTime:)`，Dispatch timer 在 target 前按观测到的 renderer P99 lead 和 scheduler wake P99 加动态安全量唤醒；不会忙等，也不会提前占住 drawable。初始 playout delay 为 95ms，再依据 ready 相对 midpoint PTS 的 P99 逐步上调/缓慢收敛。
 - 新增 scheduler slot、midpoint late-by P50/P95/P99、source fallback、source 优先覆盖、完整 NV12 对比、playout delay、renderer lead、timer lateness 和动态 safety 诊断。上屏分段日志现在输出 P50/P95/P99 与 target-to-presented。
 - 此阶段仍用异步完整 NV12 比较来严格判断重复帧；高分辨率比较的成本尚待观测，后续签名采样阶段再评估替换。`swift build -c release` 通过；默认行为未切换，真实采集场景 A/B 尚未完成。
+
+## 2026-09-28：用 Y/UV 显示签名替换整帧比较
+
+- 扩展 `SwitchFrameCadenceDetector` 的一次 NV12 只读锁：同一访问同时生成 cadence 128×72 luma、显示 Y 256×144 和交错 UV 128×72 样本。采集侧将这个签名传给插帧器，cadence detector 复用其中的 luma 样本，不再为 cadence 单独锁缓冲。
+- scheduler 与旧呈现适配路径均改为比较签名；删除实时 4K NV12 两平面的整帧 `memcmp`。signature 相同的重复捕获在 scheduler 中复用上一内容缓冲，避免为重复帧保留额外的 4K IOSurface。渲染和颜色转换路径未变。
+- 诊断新增 signature 采样时长、signature 比较 P50/P95/P99、比较次数和重复命中数；采集 callbackWork 与 PTS→callback 同时扩展到 P99。
+- 签名只覆盖采样点，Y/UV 签名相同不等于每个像素都相同；很小或刚好落在采样点之间的 HUD/UI 变化仍可能被漏掉。该风险需要用静态场景与 60Hz HUD 实机检查；P95/P99 和实际命中率也尚无硬件数据。
+- `swift build -c release` 通过，`FrameInterpolationLab` 也随构建成功。实时采集 A/B 未执行；deadline 策略仍是菜单实验项，默认 pacing 未更改。

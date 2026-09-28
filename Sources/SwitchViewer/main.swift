@@ -2,7 +2,6 @@ import Cocoa
 import AVFoundation
 import CoreImage
 import CoreMedia
-import Darwin
 import IOKit.pwr_mgt
 import Metal
 import VideoToolbox
@@ -504,6 +503,7 @@ final class CaptureDisplayAwakeAssertion {
 
 struct PresentationFrame {
     let pixelBuffer: CVPixelBuffer
+    let displaySignature: DisplayFrameSignature?
     let isInterpolated: Bool
     let minimumPresentationDuration: TimeInterval?
     let presentationTimestampHostTime: CFTimeInterval?
@@ -512,7 +512,8 @@ struct PresentationFrame {
     let sourceContentRootID: UInt64?
     let timing: PresentationFrameTiming
 
-    init(pixelBuffer: CVPixelBuffer, isInterpolated: Bool,
+    init(pixelBuffer: CVPixelBuffer, displaySignature: DisplayFrameSignature? = nil,
+         isInterpolated: Bool,
          minimumPresentationDuration: TimeInterval?,
          presentationTimestampHostTime: CFTimeInterval?,
          targetPresentationHostTime: CFTimeInterval? = nil,
@@ -520,6 +521,7 @@ struct PresentationFrame {
          sourceContentRootID: UInt64? = nil,
          timing: PresentationFrameTiming) {
         self.pixelBuffer = pixelBuffer
+        self.displaySignature = displaySignature
         self.isInterpolated = isInterpolated
         self.minimumPresentationDuration = minimumPresentationDuration
         self.presentationTimestampHostTime = presentationTimestampHostTime
@@ -532,6 +534,7 @@ struct PresentationFrame {
 
 protocol FrameInterpolationEngine: AnyObject {
     func submit(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime,
+                displaySignature: DisplayFrameSignature?,
                 completion: @escaping FrameInterpolationCompletion)
     func setMode(_ mode: FrameInterpolationMode)
     func reset()
@@ -565,6 +568,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
     private struct Submission {
         let buffer: CVPixelBuffer
         let presentationTimeStamp: CMTime
+        let displaySignature: DisplayFrameSignature?
         let completion: FrameInterpolationCompletion
         let submittedAtUptime: TimeInterval
     }
@@ -654,9 +658,11 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
     }
 
     func submit(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime,
+                displaySignature: DisplayFrameSignature?,
                 completion: @escaping FrameInterpolationCompletion) {
         let submission = Submission(buffer: pixelBuffer,
                                     presentationTimeStamp: presentationTimeStamp,
+                                    displaySignature: displaySignature,
                                     completion: completion,
                                     submittedAtUptime: ProcessInfo.processInfo.systemUptime)
         submissionLock.lock()
@@ -686,7 +692,8 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let seconds = CMTimeGetSeconds(submission.presentationTimeStamp)
         let cadence: SwitchFrameCadenceDetector.Result?
         if seconds.isFinite {
-            cadence = cadenceDetector.observe(submission.buffer, presentationTime: seconds)
+            cadence = cadenceDetector.observe(submission.buffer, presentationTime: seconds,
+                                               signature: submission.displaySignature)
         } else {
             cadenceDetector.reset()
             cadence = nil
@@ -1257,11 +1264,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var inputQueueDropCount = 0
     var presentationLimitDropCount = 0
     var rendererFailureCount = 0
-    var exactDuplicateSourceCount = 0
-    var sourceCompareCount = 0
-    var sourceCompareTotalMilliseconds = 0.0
-    var sourceCompareMaxMilliseconds = 0.0
-    var lastAcceptedSourceBuffer: CVPixelBuffer?
+    var signatureDuplicateSourceCount = 0
+    var signatureCompareCount = 0
+    var signatureCompareTotalMilliseconds = 0.0
+    var signatureCompareMaxMilliseconds = 0.0
+    var lastAcceptedSourceSignature: DisplayFrameSignature?
     var consecFails = 0
     var didLogRenderFailure = false
     var lastPixelBuffer: CVPixelBuffer?
@@ -1305,6 +1312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private struct CaptureCallbackTimingSample {
         let ptsToCallbackMilliseconds: Double?
         let callbackWorkMilliseconds: Double
+        let signatureSamplingMilliseconds: Double?
     }
     private let captureCallbackTimingQueue = DispatchQueue(label: "switchviewer.capture-callback-timing")
     private var captureCallbackTimingSamples: [CaptureCallbackTimingSample] = []
@@ -1328,7 +1336,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             enableFallback("Metal 初始化失败：\(metalInitError ?? "?")")
         }
         diagnosticLog.append("Metal 初始化; result=\(metalInitError ?? "OK"); selfTest=\(metalSelfTest ?? "通过")")
-        diagnosticLog.append("低延迟呈现队列; maximumDrawableCount=\(maximumPresentationInFlightFrames); inFlightLimit=\(maximumPresentationInFlightFrames); presentationPacing=\(presentationPacingMode.label); captureCallbackQueueQoS=userInteractive; exactSourceDedupe=fullNV12")
+        diagnosticLog.append("低延迟呈现队列; maximumDrawableCount=\(maximumPresentationInFlightFrames); inFlightLimit=\(maximumPresentationInFlightFrames); presentationPacing=\(presentationPacingMode.label); captureCallbackQueueQoS=userInteractive; sourceDedupe=sampledDisplaySignature(Y=256x144,UV=128x72)")
         refreshDevices(selectPreferred: true)
         NotificationCenter.default.addObserver(self, selector: #selector(deviceDisconnected(_:)),
                                                name: .AVCaptureDeviceWasDisconnected, object: nil)
@@ -1385,18 +1393,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let inputQueueDrops = inputQueueDropCount
         let presentationLimitDrops = presentationLimitDropCount
         let rendererFailures = rendererFailureCount
-        let exactDuplicateSources = exactDuplicateSourceCount
-        let sourceComparisons = sourceCompareCount
-        let sourceCompareTotal = sourceCompareTotalMilliseconds
-        let sourceCompareMax = sourceCompareMaxMilliseconds
+        let signatureDuplicateSources = signatureDuplicateSourceCount
+        let signatureComparisons = signatureCompareCount
+        let signatureCompareTotal = signatureCompareTotalMilliseconds
+        let signatureCompareMax = signatureCompareMaxMilliseconds
         frameLock.unlock()
 
         let selectedIndex = formatPopup.indexOfSelectedItem
         let selected = formatOptions.indices.contains(selectedIndex) ? formatOptions[selectedIndex].label : "无"
         let actual = currentVideoDevice.map(actualFormatLine) ?? "无设备"
-        let sourceCompareAverage = sourceComparisons > 0
-            ? sourceCompareTotal / Double(sourceComparisons) : 0
-        diagnosticLog.append("定时状态; session=\(session.isRunning ? "运行中" : "停止"); preset=\(session.sessionPreset.rawValue); device=\(currentVideoDevice?.localizedName ?? "无"); audio=\(currentAudioDevice?.localizedName ?? "无"); requested=\(selected); active=\(actual); buffer=\(width)x\(height) \(pixelFormat); fps=\(String(format: "%.1f", fps)); frames=\(frames); dropped=\(dropped); inputQueueDrops=\(inputQueueDrops); presentationLimitDrops=\(presentationLimitDrops); rendererFailures=\(rendererFailures); exactDuplicateSourcesSuppressed=\(exactDuplicateSources); fullFrameComparisons=\(sourceComparisons); compareAvgMaxMs=\(String(format: "%.3f/%.3f", sourceCompareAverage, sourceCompareMax)); frameInterpolation=\(interpolationEnabled ? "开" : "关"); interpolationMode=\(frameInterpolationMode.label); presentationPacing=\(presentationPacing); interpolatedFrames=\(interpolatedFrames); repeatedFrameSkips=\(repeatedFrameSkips); interpolationFailures=\(interpolationFailures); interpolationError=\(interpolationError); lastFrame=\(lastFrameAge); renderError=\(renderError); metal=\(metalInitError ?? "OK"); fallback=\(fallbackLayer == nil ? "否" : "是"); color=\(renderer?.colorMode.label ?? "无")")
+        let signatureCompareAverage = signatureComparisons > 0
+            ? signatureCompareTotal / Double(signatureComparisons) : 0
+        diagnosticLog.append("定时状态; session=\(session.isRunning ? "运行中" : "停止"); preset=\(session.sessionPreset.rawValue); device=\(currentVideoDevice?.localizedName ?? "无"); audio=\(currentAudioDevice?.localizedName ?? "无"); requested=\(selected); active=\(actual); buffer=\(width)x\(height) \(pixelFormat); fps=\(String(format: "%.1f", fps)); frames=\(frames); dropped=\(dropped); inputQueueDrops=\(inputQueueDrops); presentationLimitDrops=\(presentationLimitDrops); rendererFailures=\(rendererFailures); signatureDuplicateSourcesSuppressed=\(signatureDuplicateSources); signatureComparisons=\(signatureComparisons); signatureCompareAvgMaxMs=\(String(format: "%.3f/%.3f", signatureCompareAverage, signatureCompareMax)); frameInterpolation=\(interpolationEnabled ? "开" : "关"); interpolationMode=\(frameInterpolationMode.label); presentationPacing=\(presentationPacing); interpolatedFrames=\(interpolatedFrames); repeatedFrameSkips=\(repeatedFrameSkips); interpolationFailures=\(interpolationFailures); interpolationError=\(interpolationError); lastFrame=\(lastFrameAge); renderError=\(renderError); metal=\(metalInitError ?? "OK"); fallback=\(fallbackLayer == nil ? "否" : "是"); color=\(renderer?.colorMode.label ?? "无")")
     }
 
     // Metal 不可用时切回系统预览层，保证不断片
@@ -1912,6 +1920,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameLock.lock()
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch
+        detectedGameFPS = nil
         let interpolationEngine = frameInterpolationEngine
         interpolatedFrameCount = 0
         interpolationRepeatedFrameSkipCount = 0
@@ -1941,11 +1950,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.inputQueueDropCount = 0
             self.presentationLimitDropCount = 0
             self.rendererFailureCount = 0
-            self.exactDuplicateSourceCount = 0
-            self.sourceCompareCount = 0
-            self.sourceCompareTotalMilliseconds = 0
-            self.sourceCompareMaxMilliseconds = 0
-            self.lastAcceptedSourceBuffer = nil
+            self.signatureDuplicateSourceCount = 0
+            self.signatureCompareCount = 0
+            self.signatureCompareTotalMilliseconds = 0
+            self.signatureCompareMaxMilliseconds = 0
+            self.lastAcceptedSourceSignature = nil
             self.consecFails = 0
             self.didLogRenderFailure = false
             self.firstRenderError = nil
@@ -2202,7 +2211,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameInterpolationMode = mode
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch
-        lastAcceptedSourceBuffer = nil
+        detectedGameFPS = nil
+        lastAcceptedSourceSignature = nil
         let engine = frameInterpolationEngine
         frameLock.unlock()
         presentationScheduler.reset(epoch: epoch)
@@ -2333,7 +2343,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameInterpolationEnabled = shouldEnable
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch
-        lastAcceptedSourceBuffer = nil
+        detectedGameFPS = nil
+        lastAcceptedSourceSignature = nil
         frameInterpolationMenuItem.state = shouldEnable ? .on : .off
         let activeEngine = frameInterpolationEngine
         frameLock.unlock()
@@ -2617,11 +2628,13 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     private func recordCaptureCallbackTiming(ptsToCallbackMilliseconds: Double?,
-                                             callbackWorkMilliseconds: Double) {
+                                             callbackWorkMilliseconds: Double,
+                                             signatureSamplingMilliseconds: Double?) {
         captureCallbackTimingQueue.async {
             self.captureCallbackTimingSamples.append(CaptureCallbackTimingSample(
                 ptsToCallbackMilliseconds: ptsToCallbackMilliseconds,
-                callbackWorkMilliseconds: callbackWorkMilliseconds))
+                callbackWorkMilliseconds: callbackWorkMilliseconds,
+                signatureSamplingMilliseconds: signatureSamplingMilliseconds))
             let now = ProcessInfo.processInfo.systemUptime
             guard now - self.lastCaptureCallbackTimingReportUptime >= 3,
                   !self.captureCallbackTimingSamples.isEmpty else { return }
@@ -2638,11 +2651,12 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
             func range(_ values: [Double]) -> String {
                 guard let p50 = percentile(values, 0.50),
-                      let p95 = percentile(values, 0.95) else { return "无" }
-                return String(format: "%.1f/%.1f", p50, p95)
+                      let p95 = percentile(values, 0.95),
+                      let p99 = percentile(values, 0.99) else { return "无" }
+                return String(format: "%.1f/%.1f/%.1f", p50, p95, p99)
             }
             self.diagnosticLog.append(
-                "采集回调耗时 P50/P95 ms; samples=\(samples.count); ptsToCallback=\(range(samples.compactMap(\.ptsToCallbackMilliseconds))); callbackWork=\(range(samples.map(\.callbackWorkMilliseconds)))")
+                "采集回调耗时 P50/P95/P99 ms; samples=\(samples.count); ptsToCallback=\(range(samples.compactMap(\.ptsToCallbackMilliseconds))); signatureSampling=\(range(samples.compactMap(\.signatureSamplingMilliseconds))); callbackWork=\(range(samples.map(\.callbackWorkMilliseconds)))")
         }
     }
 
@@ -2650,10 +2664,12 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                        from connection: AVCaptureConnection) {
         let callbackWorkStart = ProcessInfo.processInfo.systemUptime
         var ptsToCallbackMilliseconds: Double?
+        var signatureSamplingMilliseconds: Double?
         defer {
             let callbackWorkMilliseconds = (ProcessInfo.processInfo.systemUptime - callbackWorkStart) * 1_000
             recordCaptureCallbackTiming(ptsToCallbackMilliseconds: ptsToCallbackMilliseconds,
-                                        callbackWorkMilliseconds: callbackWorkMilliseconds)
+                                        callbackWorkMilliseconds: callbackWorkMilliseconds,
+                                        signatureSamplingMilliseconds: signatureSamplingMilliseconds)
         }
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -2703,6 +2719,13 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                 }
             }
         }
+        let signatureStartUptime = ProcessInfo.processInfo.systemUptime
+        let displaySignature = interpolationEnabled
+            ? SwitchFrameCadenceDetector.makeDisplayFrameSignature(from: pb) : nil
+        if interpolationEnabled {
+            signatureSamplingMilliseconds = (ProcessInfo.processInfo.systemUptime
+                                             - signatureStartUptime) * 1_000
+        }
         if interpolationEnabled,
            interpolationMode == .appleLowLatency4KProxy,
            pacingMode == .deadlineScheduled,
@@ -2716,13 +2739,15 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             presentationScheduler.offerSource(CapturedSourceFrame(
                 id: sourceID,
                 pixelBuffer: pb,
+                signature: displaySignature,
                 presentationTimeStamp: presentationTimeStamp,
                 mediaHostTime: presentationTimestampHostTime,
                 captureCallbackHostTime: captureCallbackHostTime,
                 epoch: epoch))
             let interpolationSubmittedHostTime = presentationHostTimeNow()
             interpolationEngine.submit(pb,
-                                       presentationTimeStamp: presentationTimeStamp) {
+                                       presentationTimeStamp: presentationTimeStamp,
+                                       displaySignature: displaySignature) {
                 [weak self] generated, error, halfInterval in
                 guard let self else { return }
                 if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
@@ -2756,13 +2781,15 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
         } else if interpolationEnabled, let interpolationEngine {
             interpolationEngine.submit(pb,
-                                       presentationTimeStamp: presentationTimeStamp) {
+                                       presentationTimeStamp: presentationTimeStamp,
+                                       displaySignature: displaySignature) {
                 [weak self] generated, error, halfInterval in
                 guard let self else { return }
                 if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
                     self.recordInterpolationFailure(error)
                 }
                 self.enqueueInterpolatedFrames(generated: generated, source: pb,
+                                               sourceDisplaySignature: displaySignature,
                                                sourcePresentationTimeStamp: presentationTimeStamp,
                                                sourceTimestampHostTime: presentationTimestampHostTime,
                                                captureCallbackHostTime: captureCallbackHostTime,
@@ -2780,6 +2807,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
     }
 
     func enqueueInterpolatedFrames(generated: CVPixelBuffer?, source: CVPixelBuffer,
+                                   sourceDisplaySignature: DisplayFrameSignature?,
                                    sourcePresentationTimeStamp: CMTime,
                                    sourceTimestampHostTime: CFTimeInterval?,
                                    captureCallbackHostTime: CFTimeInterval,
@@ -2808,7 +2836,9 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                     captureCallbackHostTime: captureCallbackHostTime,
                     processingReadyHostTime: processingReadyHostTime)))
         }
-        frames.append(PresentationFrame(pixelBuffer: source, isInterpolated: false,
+        frames.append(PresentationFrame(pixelBuffer: source,
+                                        displaySignature: sourceDisplaySignature,
+                                        isInterpolated: false,
                                         minimumPresentationDuration: generated == nil
                                             ? nil : minimumPresentationDuration,
                                         presentationTimestampHostTime: sourceTimestampHostTime,
@@ -2823,24 +2853,25 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard canPresentFrame(epoch: epoch, requireInterpolation: requireInterpolation) else { return }
         var candidates = frames
         if requireInterpolation,
-           let sourceFrame = frames.first(where: { !$0.isInterpolated }) {
+           let sourceFrame = frames.first(where: { !$0.isInterpolated }),
+           sourceFrame.sourceID == nil {
             frameLock.lock()
-            let previousSource = lastAcceptedSourceBuffer
+            let previousSignature = lastAcceptedSourceSignature
             frameLock.unlock()
-            if let previousSource {
+            if let previousSignature, let currentSignature = sourceFrame.displaySignature {
                 let compareStart = ProcessInfo.processInfo.systemUptime
-                let isIdentical = pixelBuffersHaveIdenticalPixels(previousSource, sourceFrame.pixelBuffer)
+                let isIdentical = previousSignature == currentSignature
                 let compareMilliseconds = (ProcessInfo.processInfo.systemUptime - compareStart) * 1_000
                 frameLock.lock()
-                sourceCompareCount += 1
-                sourceCompareTotalMilliseconds += compareMilliseconds
-                sourceCompareMaxMilliseconds = max(sourceCompareMaxMilliseconds, compareMilliseconds)
-                if isIdentical { exactDuplicateSourceCount += 1 }
+                signatureCompareCount += 1
+                signatureCompareTotalMilliseconds += compareMilliseconds
+                signatureCompareMaxMilliseconds = max(signatureCompareMaxMilliseconds,
+                                                      compareMilliseconds)
+                if isIdentical { signatureDuplicateSourceCount += 1 }
                 frameLock.unlock()
                 if isIdentical {
                     // The layer keeps the last drawable visible. Only suppress a source
-                    // frame after proving every active NV12 plane byte is unchanged;
-                    // 60Hz HUD/UI changes therefore still reach the screen.
+                    // frame when the sampled luma/chroma signature is unchanged.
                     candidates.removeAll { !$0.isInterpolated }
                 }
             }
@@ -2867,7 +2898,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         if admitted.isEmpty { return }
         if let source = admitted.last(where: { !$0.isInterpolated }) {
             frameLock.lock()
-            lastAcceptedSourceBuffer = source.pixelBuffer
+            lastAcceptedSourceSignature = source.displaySignature
             frameLock.unlock()
         }
         for frame in admitted { frame.timing.mark(.presentationEnqueued) }
@@ -2883,37 +2914,6 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                                        onPresented: { self.presentationSlots.signal() })
             }
         }
-    }
-
-    private func pixelBuffersHaveIdenticalPixels(_ first: CVPixelBuffer,
-                                                 _ second: CVPixelBuffer) -> Bool {
-        if first === second { return true }
-        guard CVPixelBufferGetWidth(first) == CVPixelBufferGetWidth(second),
-              CVPixelBufferGetHeight(first) == CVPixelBufferGetHeight(second),
-              CVPixelBufferGetPixelFormatType(first) == CVPixelBufferGetPixelFormatType(second),
-              CVPixelBufferGetPlaneCount(first) == 2,
-              CVPixelBufferGetPlaneCount(second) == 2 else { return false }
-        let firstMatrix = CVBufferCopyAttachment(first, kCVImageBufferYCbCrMatrixKey, nil) as? String
-        let secondMatrix = CVBufferCopyAttachment(second, kCVImageBufferYCbCrMatrixKey, nil) as? String
-        guard firstMatrix == secondMatrix else { return false }
-
-        guard CVPixelBufferLockBaseAddress(first, .readOnly) == kCVReturnSuccess else { return false }
-        defer { CVPixelBufferUnlockBaseAddress(first, .readOnly) }
-        guard CVPixelBufferLockBaseAddress(second, .readOnly) == kCVReturnSuccess else { return false }
-        defer { CVPixelBufferUnlockBaseAddress(second, .readOnly) }
-
-        for plane in 0..<2 {
-            guard let firstBase = CVPixelBufferGetBaseAddressOfPlane(first, plane),
-                  let secondBase = CVPixelBufferGetBaseAddressOfPlane(second, plane) else { return false }
-            let firstStride = CVPixelBufferGetBytesPerRowOfPlane(first, plane)
-            let secondStride = CVPixelBufferGetBytesPerRowOfPlane(second, plane)
-            let rows = CVPixelBufferGetHeightOfPlane(first, plane)
-            guard firstStride == secondStride,
-                  rows == CVPixelBufferGetHeightOfPlane(second, plane) else { return false }
-            let byteCount = firstStride * rows
-            if Darwin.memcmp(firstBase, secondBase, byteCount) != 0 { return false }
-        }
-        return true
     }
 
     func canPresentFrame(epoch: Int, requireInterpolation: Bool) -> Bool {

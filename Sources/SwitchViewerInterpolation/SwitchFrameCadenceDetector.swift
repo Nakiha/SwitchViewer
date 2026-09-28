@@ -1,6 +1,16 @@
 import CoreVideo
 import Foundation
 
+public struct DisplayFrameSignature: Equatable {
+    public let width: Int
+    public let height: Int
+    public let pixelFormat: OSType
+    public let yCbCrMatrix: String?
+    public let cadenceLumaSamples: [UInt8]
+    public let displayLumaSamples: [UInt8]
+    public let displayChromaSamples: [UInt8]
+}
+
 /// Detects game content that updates at half the capture cadence, even when a
 /// smaller part of the composite image (such as a console UI overlay) changes
 /// on every captured frame.
@@ -18,6 +28,7 @@ public final class SwitchFrameCadenceDetector {
         public let dynamicSampleCount: Int
         /// Mean absolute luma change across the 128x72 sample, normalized to 0...1.
         public let frameDifferenceScore: Double
+        public let displaySignature: DisplayFrameSignature?
 
         /// Wait for a stable cadence first; once detected, skip only intervals
         /// where the game content is a repeat. Unknown or native-rate content
@@ -33,8 +44,6 @@ public final class SwitchFrameCadenceDetector {
         let difference: [UInt8]
     }
 
-    private let sampleWidth = 128
-    private let sampleHeight = 72
     // Twelve capture intervals hold six 30fps cycles or four 40fps cycles at 60Hz.
     private let historyLength = 12
     private let lowMotionThreshold = 1.5
@@ -54,17 +63,25 @@ public final class SwitchFrameCadenceDetector {
     }
 
     /// Call once for each captured frame, in presentation-time order.
-    public func observe(_ pixelBuffer: CVPixelBuffer, presentationTime: Double) -> Result {
-        let samples = sampleLuma(pixelBuffer)
+    public func observe(_ pixelBuffer: CVPixelBuffer, presentationTime: Double,
+                        signature: DisplayFrameSignature? = nil) -> Result {
+        let displaySignature = signature
+        let samples = displaySignature?.cadenceLumaSamples ?? sampleLuma(pixelBuffer)
         defer {
             previousSamples = samples
             previousTime = presentationTime
         }
-        guard let previousSamples, let previousTime else { return unknown() }
+        guard !samples.isEmpty else {
+            intervals.removeAll(keepingCapacity: true)
+            return unknown(displaySignature: displaySignature)
+        }
+        guard let previousSamples, let previousTime else {
+            return unknown(displaySignature: displaySignature)
+        }
         let interval = presentationTime - previousTime
         guard interval > 0, interval < 0.25, samples.count == previousSamples.count else {
             intervals.removeAll(keepingCapacity: true)
-            return unknown()
+            return unknown(displaySignature: displaySignature)
         }
         let differences = zip(samples, previousSamples).map { UInt8(abs(Int($0) - Int($1))) }
         let frameDifferenceScore = Double(differences.reduce(0) { $0 + Int($1) })
@@ -73,7 +90,10 @@ public final class SwitchFrameCadenceDetector {
         if intervals.count > historyLength {
             intervals.removeFirst(intervals.count - historyLength)
         }
-        guard intervals.count == historyLength else { return unknown(frameDifferenceScore: frameDifferenceScore) }
+        guard intervals.count == historyLength else {
+            return unknown(frameDifferenceScore: frameDifferenceScore,
+                           displaySignature: displaySignature)
+        }
 
         struct Candidate {
             let period: Int
@@ -149,7 +169,10 @@ public final class SwitchFrameCadenceDetector {
         }
         guard let candidate = candidates.max(by: {
             $0.detectedCount < $1.detectedCount
-        }) else { return unknown(frameDifferenceScore: frameDifferenceScore) }
+        }) else {
+            return unknown(frameDifferenceScore: frameDifferenceScore,
+                           displaySignature: displaySignature)
+        }
         let detectedCount = candidate.detectedCount
         let dynamicCount = candidate.dynamicCount
         let confidence = dynamicCount == 0 ? 0 : Double(detectedCount) / Double(dynamicCount)
@@ -183,26 +206,32 @@ public final class SwitchFrameCadenceDetector {
                       intervalsSincePreviousGameUpdate: intervalsSincePreviousGameUpdate,
                       repeatedMotionCoverage: detected ? coverage : 0,
                       dynamicSampleCount: dynamicCount,
-                      frameDifferenceScore: frameDifferenceScore)
+                      frameDifferenceScore: frameDifferenceScore,
+                      displaySignature: displaySignature)
     }
 
-    private func unknown(frameDifferenceScore: Double = 0) -> Result {
+    private func unknown(frameDifferenceScore: Double = 0,
+                         displaySignature: DisplayFrameSignature? = nil) -> Result {
         Result(captureFPS: nil, gameFPS: nil, confidence: 0,
                cadencePeriod: nil, repeatedGameFrame: false,
                intervalsSincePreviousGameUpdate: nil,
                repeatedMotionCoverage: 0, dynamicSampleCount: 0,
-               frameDifferenceScore: frameDifferenceScore)
+               frameDifferenceScore: frameDifferenceScore,
+               displaySignature: displaySignature)
     }
 
     private func sampleLuma(_ pixelBuffer: CVPixelBuffer) -> [UInt8] {
+        let sampleWidth = 128
+        let sampleHeight = 72
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
         guard width > 0, height > 0,
-              CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-                || CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange else {
+              pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+              CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
             return []
         }
-        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return [] }
         let stride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
@@ -217,5 +246,79 @@ public final class SwitchFrameCadenceDetector {
             }
         }
         return result
+    }
+
+    public static func makeDisplayFrameSignature(from pixelBuffer: CVPixelBuffer)
+        -> DisplayFrameSignature? {
+        let cadenceSampleWidth = 128
+        let cadenceSampleHeight = 72
+        let displaySampleWidth = 256
+        let displaySampleHeight = 144
+        let chromaSampleWidth = 128
+        let chromaSampleHeight = 72
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        guard width > 0, height > 0,
+              pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                || pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+              CVPixelBufferGetPlaneCount(pixelBuffer) == 2,
+              CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly) == kCVReturnSuccess else {
+            return nil
+        }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let lumaBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let chromaBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
+            return nil
+        }
+        let lumaStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let chromaStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+        let chromaWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1)
+        let chromaHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
+        guard lumaStride >= width, chromaStride >= chromaWidth * 2,
+              chromaWidth > 0, chromaHeight > 0 else { return nil }
+        let lumaPixels = lumaBase.assumingMemoryBound(to: UInt8.self)
+        let chromaPixels = chromaBase.assumingMemoryBound(to: UInt8.self)
+        var cadenceLuma = [UInt8](repeating: 0,
+                                  count: cadenceSampleWidth * cadenceSampleHeight)
+        for y in 0..<cadenceSampleHeight {
+            let sourceY = min(height - 1, (2 * y + 1) * height / (2 * cadenceSampleHeight))
+            let row = lumaPixels.advanced(by: sourceY * lumaStride)
+            for x in 0..<cadenceSampleWidth {
+                let sourceX = min(width - 1, (2 * x + 1) * width / (2 * cadenceSampleWidth))
+                cadenceLuma[y * cadenceSampleWidth + x] = row[sourceX]
+            }
+        }
+        var displayLuma = [UInt8](repeating: 0,
+                                  count: displaySampleWidth * displaySampleHeight)
+        for y in 0..<displaySampleHeight {
+            let sourceY = min(height - 1, (2 * y + 1) * height / (2 * displaySampleHeight))
+            let row = lumaPixels.advanced(by: sourceY * lumaStride)
+            for x in 0..<displaySampleWidth {
+                let sourceX = min(width - 1, (2 * x + 1) * width / (2 * displaySampleWidth))
+                displayLuma[y * displaySampleWidth + x] = row[sourceX]
+            }
+        }
+        var displayChroma = [UInt8](repeating: 0,
+                                    count: chromaSampleWidth * chromaSampleHeight * 2)
+        for y in 0..<chromaSampleHeight {
+            let sourceY = min(chromaHeight - 1,
+                              (2 * y + 1) * chromaHeight / (2 * chromaSampleHeight))
+            let row = chromaPixels.advanced(by: sourceY * chromaStride)
+            for x in 0..<chromaSampleWidth {
+                let sourceX = min(chromaWidth - 1,
+                                  (2 * x + 1) * chromaWidth / (2 * chromaSampleWidth))
+                let destinationOffset = (y * chromaSampleWidth + x) * 2
+                displayChroma[destinationOffset] = row[sourceX * 2]
+                displayChroma[destinationOffset + 1] = row[sourceX * 2 + 1]
+            }
+        }
+        let matrix = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey,
+                                            nil) as? String
+        return DisplayFrameSignature(width: width, height: height,
+                                     pixelFormat: pixelFormat, yCbCrMatrix: matrix,
+                                     cadenceLumaSamples: cadenceLuma,
+                                     displayLumaSamples: displayLuma,
+                                     displayChromaSamples: displayChroma)
     }
 }

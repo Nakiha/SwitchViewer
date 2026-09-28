@@ -1,11 +1,12 @@
 import CoreMedia
 import CoreVideo
-import Darwin
 import Foundation
+import SwitchViewerInterpolation
 
 struct CapturedSourceFrame {
     let id: UInt64
     let pixelBuffer: CVPixelBuffer
+    let signature: DisplayFrameSignature?
     let presentationTimeStamp: CMTime
     let mediaHostTime: CFTimeInterval
     let captureCallbackHostTime: CFTimeInterval
@@ -58,6 +59,7 @@ final class PresentationScheduler {
     private var renderLeadSamples: [Double] = []
     private var schedulerWakeLatenessSamples: [Double] = []
     private var midpointLateBySamples: [Double] = []
+    private var signatureCompareTimeSamples: [Double] = []
     private var playoutDelayMilliseconds = 95.0
     private var lastDelayDecreaseUptime = ProcessInfo.processInfo.systemUptime
     private var lastReportUptime = ProcessInfo.processInfo.systemUptime
@@ -67,8 +69,8 @@ final class PresentationScheduler {
     private var lateMidpointDropCount = 0
     private var sourceFallbackCount = 0
     private var midpointSupersededBySourceCount = 0
-    private var fullNV12CompareCount = 0
-    private var exactDuplicateSourceCount = 0
+    private var signatureCompareCount = 0
+    private var signatureDuplicateCount = 0
 
     init(onFrame: @escaping (PresentationFrame, Int) -> Void,
          onReport: @escaping (String) -> Void) {
@@ -88,6 +90,7 @@ final class PresentationScheduler {
             self.renderLeadSamples.removeAll(keepingCapacity: true)
             self.schedulerWakeLatenessSamples.removeAll(keepingCapacity: true)
             self.midpointLateBySamples.removeAll(keepingCapacity: true)
+            self.signatureCompareTimeSamples.removeAll(keepingCapacity: true)
             self.playoutDelayMilliseconds = 95.0
             self.lastDelayDecreaseUptime = ProcessInfo.processInfo.systemUptime
             self.sourceSlotCount = 0
@@ -96,8 +99,8 @@ final class PresentationScheduler {
             self.lateMidpointDropCount = 0
             self.sourceFallbackCount = 0
             self.midpointSupersededBySourceCount = 0
-            self.fullNV12CompareCount = 0
-            self.exactDuplicateSourceCount = 0
+            self.signatureCompareCount = 0
+            self.signatureDuplicateCount = 0
         }
     }
 
@@ -106,19 +109,41 @@ final class PresentationScheduler {
             guard frame.epoch == self.epoch else { return }
             let previous = self.latestSource
             var isDuplicate = false
-            if let previous {
-                self.fullNV12CompareCount += 1
-                isDuplicate = Self.pixelBuffersHaveIdenticalPixels(previous.pixelBuffer,
-                                                                  frame.pixelBuffer)
-                if isDuplicate { self.exactDuplicateSourceCount += 1 }
+            if let previousSignature = previous?.signature,
+               let currentSignature = frame.signature {
+                self.signatureCompareCount += 1
+                let compareStart = ProcessInfo.processInfo.systemUptime
+                isDuplicate = previousSignature == currentSignature
+                self.signatureCompareTimeSamples.append(
+                    (ProcessInfo.processInfo.systemUptime - compareStart) * 1_000)
+                if self.signatureCompareTimeSamples.count > 180 {
+                    self.signatureCompareTimeSamples.removeFirst(
+                        self.signatureCompareTimeSamples.count - 180)
+                }
+                if isDuplicate { self.signatureDuplicateCount += 1 }
             }
             let contentRootID = isDuplicate
                 ? (self.latestSourceContentRootID ?? frame.id)
                 : frame.id
-            self.latestSource = frame
+            let scheduledFrame: CapturedSourceFrame
+            if isDuplicate, let previous {
+                // Reuse the last known buffer for this sampled content so duplicate
+                // capture buffers do not remain retained for the playout delay.
+                scheduledFrame = CapturedSourceFrame(
+                    id: frame.id,
+                    pixelBuffer: previous.pixelBuffer,
+                    signature: frame.signature,
+                    presentationTimeStamp: frame.presentationTimeStamp,
+                    mediaHostTime: frame.mediaHostTime,
+                    captureCallbackHostTime: frame.captureCallbackHostTime,
+                    epoch: frame.epoch)
+            } else {
+                scheduledFrame = frame
+            }
+            self.latestSource = scheduledFrame
             self.latestSourceContentRootID = contentRootID
             let slot = self.slot(for: frame.mediaHostTime)
-            slot.source = frame
+            slot.source = scheduledFrame
             slot.sourceIsDuplicate = isDuplicate
             slot.sourceContentRootID = contentRootID
             slot.duplicateOfContentRootID = isDuplicate ? contentRootID : nil
@@ -299,7 +324,9 @@ final class PresentationScheduler {
     private func makeFrame(from source: CapturedSourceFrame,
                            target: CFTimeInterval?,
                            contentRootID: UInt64?) -> PresentationFrame {
-        PresentationFrame(pixelBuffer: source.pixelBuffer, isInterpolated: false,
+        PresentationFrame(pixelBuffer: source.pixelBuffer,
+                          displaySignature: source.signature,
+                          isInterpolated: false,
                           minimumPresentationDuration: nil,
                           presentationTimestampHostTime: source.mediaHostTime,
                           targetPresentationHostTime: target,
@@ -331,15 +358,19 @@ final class PresentationScheduler {
         let lateP95 = Self.percentile(midpointLateBySamples, 0.95)
         let lateP99 = Self.percentile(midpointLateBySamples, 0.99)
         let wakeP99 = Self.percentile(schedulerWakeLatenessSamples, 0.99)
-        onReport("deadline scheduler; sourceOffers=\(sourceSlotCount) midpointOffers=\(midpointSlotCount) heldSlots=\(heldSlotCount); lateMidpointDrops=\(lateMidpointDropCount); midpointLateByP50P95P99Ms=\(lateP50.map { String(format: "%.1f", $0) } ?? "无")/\(lateP95.map { String(format: "%.1f", $0) } ?? "无")/\(lateP99.map { String(format: "%.1f", $0) } ?? "无"); sourceFallbacks=\(sourceFallbackCount); midpointSupersededBySource=\(midpointSupersededBySourceCount); fullNV12Compare=\(fullNV12CompareCount); exactDuplicateSource=\(exactDuplicateSourceCount); playoutDelayP99Ms=\(String(format: "%.1f", playoutDelayMilliseconds)); renderLeadP99Ms=\(String(format: "%.1f", renderLeadP99Milliseconds)); schedulerWakeLatenessP99Ms=\(wakeP99.map { String(format: "%.2f", $0) } ?? "无"); deadlineSafetyMs=\(String(format: "%.2f", deadlineSafetyMilliseconds))")
+        let compareP50 = Self.percentile(signatureCompareTimeSamples, 0.50)
+        let compareP95 = Self.percentile(signatureCompareTimeSamples, 0.95)
+        let compareP99 = Self.percentile(signatureCompareTimeSamples, 0.99)
+        onReport("deadline scheduler; sourceOffers=\(sourceSlotCount) midpointOffers=\(midpointSlotCount) heldSlots=\(heldSlotCount); lateMidpointDrops=\(lateMidpointDropCount); midpointLateByP50P95P99Ms=\(lateP50.map { String(format: "%.1f", $0) } ?? "无")/\(lateP95.map { String(format: "%.1f", $0) } ?? "无")/\(lateP99.map { String(format: "%.1f", $0) } ?? "无"); sourceFallbacks=\(sourceFallbackCount); midpointSupersededBySource=\(midpointSupersededBySourceCount); signatureCompare=\(signatureCompareCount); signatureDuplicate=\(signatureDuplicateCount); signatureCompareP50P95P99Ms=\(compareP50.map { String(format: "%.3f", $0) } ?? "无")/\(compareP95.map { String(format: "%.3f", $0) } ?? "无")/\(compareP99.map { String(format: "%.3f", $0) } ?? "无"); playoutDelayP99Ms=\(String(format: "%.1f", playoutDelayMilliseconds)); renderLeadP99Ms=\(String(format: "%.1f", renderLeadP99Milliseconds)); schedulerWakeLatenessP99Ms=\(wakeP99.map { String(format: "%.2f", $0) } ?? "无"); deadlineSafetyMs=\(String(format: "%.2f", deadlineSafetyMilliseconds))")
         sourceSlotCount = 0
         midpointSlotCount = 0
         heldSlotCount = 0
         lateMidpointDropCount = 0
         sourceFallbackCount = 0
         midpointSupersededBySourceCount = 0
-        fullNV12CompareCount = 0
-        exactDuplicateSourceCount = 0
+        signatureCompareCount = 0
+        signatureDuplicateCount = 0
+        signatureCompareTimeSamples.removeAll(keepingCapacity: true)
         midpointLateBySamples.removeAll(keepingCapacity: true)
     }
 
@@ -355,31 +386,4 @@ final class PresentationScheduler {
         return sorted[index]
     }
 
-    private static func pixelBuffersHaveIdenticalPixels(_ first: CVPixelBuffer,
-                                                        _ second: CVPixelBuffer) -> Bool {
-        if first === second { return true }
-        guard CVPixelBufferGetWidth(first) == CVPixelBufferGetWidth(second),
-              CVPixelBufferGetHeight(first) == CVPixelBufferGetHeight(second),
-              CVPixelBufferGetPixelFormatType(first) == CVPixelBufferGetPixelFormatType(second),
-              CVPixelBufferGetPlaneCount(first) == 2,
-              CVPixelBufferGetPlaneCount(second) == 2 else { return false }
-        let firstMatrix = CVBufferCopyAttachment(first, kCVImageBufferYCbCrMatrixKey, nil) as? String
-        let secondMatrix = CVBufferCopyAttachment(second, kCVImageBufferYCbCrMatrixKey, nil) as? String
-        guard firstMatrix == secondMatrix,
-              CVPixelBufferLockBaseAddress(first, .readOnly) == kCVReturnSuccess else { return false }
-        defer { CVPixelBufferUnlockBaseAddress(first, .readOnly) }
-        guard CVPixelBufferLockBaseAddress(second, .readOnly) == kCVReturnSuccess else { return false }
-        defer { CVPixelBufferUnlockBaseAddress(second, .readOnly) }
-        for plane in 0..<2 {
-            guard let firstBase = CVPixelBufferGetBaseAddressOfPlane(first, plane),
-                  let secondBase = CVPixelBufferGetBaseAddressOfPlane(second, plane) else { return false }
-            let firstStride = CVPixelBufferGetBytesPerRowOfPlane(first, plane)
-            let secondStride = CVPixelBufferGetBytesPerRowOfPlane(second, plane)
-            let rows = CVPixelBufferGetHeightOfPlane(first, plane)
-            guard firstStride == secondStride,
-                  rows == CVPixelBufferGetHeightOfPlane(second, plane),
-                  Darwin.memcmp(firstBase, secondBase, firstStride * rows) == 0 else { return false }
-        }
-        return true
-    }
 }
