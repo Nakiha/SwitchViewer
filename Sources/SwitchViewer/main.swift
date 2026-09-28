@@ -1291,6 +1291,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var presentationPacingMenuItems: [NSMenuItem] = []
     var frameInterpolationEngine: FrameInterpolationEngine?
     var detectedGameFPS: Double?
+    var deadlineCadenceActive = false
+    var consecutiveNonDeadlineCadenceFrames = 0
+    private let deadlineCadenceLossGraceFrames = 18
     var nextSourceFrameID: UInt64 = 0
     lazy var presentationScheduler = PresentationScheduler(
         onFrame: { [weak self] frame, epoch in
@@ -1318,6 +1321,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var captureCallbackTimingSamples: [CaptureCallbackTimingSample] = []
     private var lastCaptureCallbackTimingReportUptime = ProcessInfo.processInfo.systemUptime
     private let captureDisplayAwakeAssertion = CaptureDisplayAwakeAssertion()
+
+    // Caller must hold frameLock.
+    private func clearDeadlineCadenceQualificationLocked() {
+        deadlineCadenceActive = false
+        consecutiveNonDeadlineCadenceFrames = 0
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         diagnosticLog.append("应用启动; macOS=\(ProcessInfo.processInfo.operatingSystemVersionString); 日志目录=\(diagnosticLog.directoryURL.path)")
@@ -1415,6 +1424,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.frameInterpolationEpoch += 1
             let epoch = self.frameInterpolationEpoch
             self.frameInterpolationEnabled = false
+            self.clearDeadlineCadenceQualificationLocked()
             self.frameInterpolationMenuItem?.state = .off
             let interpolationEngine = self.frameInterpolationEngine
             self.frameLock.unlock()
@@ -1921,6 +1931,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch
         detectedGameFPS = nil
+        clearDeadlineCadenceQualificationLocked()
         let interpolationEngine = frameInterpolationEngine
         interpolatedFrameCount = 0
         interpolationRepeatedFrameSkipCount = 0
@@ -2212,6 +2223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch
         detectedGameFPS = nil
+        clearDeadlineCadenceQualificationLocked()
         lastAcceptedSourceSignature = nil
         let engine = frameInterpolationEngine
         frameLock.unlock()
@@ -2234,6 +2246,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         presentationPacingMode = mode
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch
+        clearDeadlineCadenceQualificationLocked()
         frameLock.unlock()
         presentationScheduler.reset(epoch: epoch)
         for item in presentationPacingMenuItems {
@@ -2297,21 +2310,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         guard let self else { return }
                         self.frameLock.lock()
                         let changed = self.detectedGameFPS != gameFPS
-                        let wasDeadlineCadence = self.detectedGameFPS.map {
-                            abs($0 - 30) <= 2
-                        } ?? false
                         self.detectedGameFPS = gameFPS
                         let isDeadlineCadence = gameFPS.map { abs($0 - 30) <= 2 } ?? false
-                        let shouldResetScheduler = wasDeadlineCadence && !isDeadlineCadence
-                            && self.presentationPacingMode == .deadlineScheduled
+                        let schedulerSelected = self.presentationPacingMode == .deadlineScheduled
                             && self.frameInterpolationMode == .appleLowLatency4KProxy
+                        var shouldResetScheduler = false
+                        var schedulerResetReason: String?
+                        if !schedulerSelected {
+                            self.clearDeadlineCadenceQualificationLocked()
+                        } else if isDeadlineCadence {
+                            self.deadlineCadenceActive = true
+                            self.consecutiveNonDeadlineCadenceFrames = 0
+                        } else if self.deadlineCadenceActive {
+                            if gameFPS == nil {
+                                self.consecutiveNonDeadlineCadenceFrames += 1
+                                if self.consecutiveNonDeadlineCadenceFrames
+                                    >= self.deadlineCadenceLossGraceFrames {
+                                    self.deadlineCadenceActive = false
+                                    self.consecutiveNonDeadlineCadenceFrames = 0
+                                    shouldResetScheduler = true
+                                    schedulerResetReason = "30fps 节奏连续未知 \(self.deadlineCadenceLossGraceFrames) 帧"
+                                }
+                            } else {
+                                // A confidently detected cadence outside the scheduler's
+                                // 30fps operating range is an immediate mode exit.
+                                self.clearDeadlineCadenceQualificationLocked()
+                                shouldResetScheduler = true
+                                let cadenceLabel = gameFPS.map { String(format: "%.1f", $0) } ?? "未知"
+                                schedulerResetReason = "检测到非 30fps 节奏 \(cadenceLabel)"
+                            }
+                        }
                         if shouldResetScheduler { self.frameInterpolationEpoch += 1 }
                         let schedulerEpoch = self.frameInterpolationEpoch
                         self.frameLock.unlock()
                         if shouldResetScheduler {
-                            self.presentationScheduler.reset(epoch: schedulerEpoch)
+                            self.presentationScheduler.reset(epoch: schedulerEpoch,
+                                                             preservingLearnedTiming: true)
                             self.diagnosticLog.append(
-                                "deadline scheduler reset; 原因=30fps 节奏不再稳定")
+                                "deadline scheduler reset; 原因=\(schedulerResetReason ?? "未知"); preservingLearnedTiming=true")
                         }
                         if changed {
                             self.diagnosticLog.append(
@@ -2344,6 +2380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch
         detectedGameFPS = nil
+        clearDeadlineCadenceQualificationLocked()
         lastAcceptedSourceSignature = nil
         frameInterpolationMenuItem.state = shouldEnable ? .on : .off
         let activeEngine = frameInterpolationEngine
@@ -2692,7 +2729,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         let interpolationEngine = frameInterpolationEngine
         let interpolationMode = frameInterpolationMode
         let pacingMode = presentationPacingMode
-        let detectedGameFPS = self.detectedGameFPS
+        let deadlineCadenceActive = self.deadlineCadenceActive
         let epoch = frameInterpolationEpoch
         frameLock.unlock()
         if changed {
@@ -2729,7 +2766,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         if interpolationEnabled,
            interpolationMode == .appleLowLatency4KProxy,
            pacingMode == .deadlineScheduled,
-           let detectedGameFPS, abs(detectedGameFPS - 30) <= 2,
+           deadlineCadenceActive,
            let interpolationEngine,
            let presentationTimestampHostTime {
             frameLock.lock()
@@ -2933,6 +2970,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             frameInterpolationEnabled = false
             frameInterpolationEpoch += 1
             frameInterpolationUnavailable = true
+            clearDeadlineCadenceQualificationLocked()
         }
         let epoch = frameInterpolationEpoch
         let interpolationEngine = frameInterpolationEngine

@@ -231,3 +231,10 @@
 - 诊断新增 signature 采样时长、signature 比较 P50/P95/P99、比较次数和重复命中数；采集 callbackWork 与 PTS→callback 同时扩展到 P99。
 - 签名只覆盖采样点，Y/UV 签名相同不等于每个像素都相同；很小或刚好落在采样点之间的 HUD/UI 变化仍可能被漏掉。该风险需要用静态场景与 60Hz HUD 实机检查；P95/P99 和实际命中率也尚无硬件数据。
 - `swift build -c release` 通过，`FrameInterpolationLab` 也随构建成功。实时采集 A/B 未执行；deadline 策略仍是菜单实验项，默认 pacing 未更改。
+
+## 2026-09-28：deadline playout 初值与节奏失锁迟滞
+
+- 另一 session 的审计核实了核心因果链：目标时间是媒体 PTS 加 playout delay；完整 scheduler reset 会清空估计并恢复 95ms；每帧节奏识别结果为 unknown 时，旧逻辑立即增加 epoch、取消待排 slot 和在途插值结果。异步 VT 路径保留 command-buffer completion，没有发现实时路径上的同步 wait。
+- 同一实验版在切到 deadline 前的短基线（20:48:28–20:48:54）中，去掉启动首个异常窗口后，插值帧 callback→display 的 3 秒窗口 P50/P95 中位数为 41.1/49.2ms（5 窗口），采集帧为 57.5/58.1ms（7 窗口）。21:02:55–21:03:22 的实验模式分别为 48.0/56.1ms、64.8/73.7ms（各 10 窗口）。时间段和内容并非严格锁定的即时 A/B，但未显示时延下降，符合 reset/95ms 目标偏保守的判断。
+- 完整 reset 的 playout 初值从 95ms 降至 75ms；现有 ready-time P99 估计仍可按实测需要上调。30fps 检测短暂 unknown 时保留 scheduler 路由最多 18 个连续采集样本（约 300ms），期间照常排 source slot；检测器没有给出有效 cadence 时不会生成 midpoint。若 unknown 持续到阈值，或明确识别到其他游戏节奏，再取消 pending slot/更换 epoch，并保留已学到的 playout、renderer lead 和 wake timing；格式、模式或采集会话重配仍执行完整清理。
+- Release 构建通过；只有原有 AVCaptureDevice.devices(for:) 弃用警告。新包 `.build/SwitchViewer-Deadline-Experiment-v2.app` 独立打包并通过严格签名校验，未替换或重启仍在运行的 v1。v2 硬件 A/B 尚待重开后执行；审计提出的 50–55ms 和 callback-anchored 调度未直接采用，需用中间帧迟到率和同场 A/B 验证其 tradeoff。

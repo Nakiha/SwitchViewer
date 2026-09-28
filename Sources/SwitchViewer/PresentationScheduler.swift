@@ -60,7 +60,10 @@ final class PresentationScheduler {
     private var schedulerWakeLatenessSamples: [Double] = []
     private var midpointLateBySamples: [Double] = []
     private var signatureCompareTimeSamples: [Double] = []
-    private var playoutDelayMilliseconds = 95.0
+    // Start close to the measured end-to-end readiness budget. The estimator can
+    // raise this when real midpoint completion requires more headroom.
+    private let initialPlayoutDelayMilliseconds = 75.0
+    private var playoutDelayMilliseconds = 75.0
     private var lastDelayDecreaseUptime = ProcessInfo.processInfo.systemUptime
     private var lastReportUptime = ProcessInfo.processInfo.systemUptime
     private var sourceSlotCount = 0
@@ -78,7 +81,7 @@ final class PresentationScheduler {
         self.onReport = onReport
     }
 
-    func reset(epoch: Int) {
+    func reset(epoch: Int, preservingLearnedTiming: Bool = false) {
         queue.async {
             for slot in self.slots.values { slot.timer?.cancel() }
             self.slots.removeAll(keepingCapacity: true)
@@ -86,12 +89,14 @@ final class PresentationScheduler {
             self.latestSourceContentRootID = nil
             self.lastPresentedSourceContentRootID = nil
             self.epoch = epoch
-            self.requiredDelaySamples.removeAll(keepingCapacity: true)
-            self.renderLeadSamples.removeAll(keepingCapacity: true)
-            self.schedulerWakeLatenessSamples.removeAll(keepingCapacity: true)
+            if !preservingLearnedTiming {
+                self.requiredDelaySamples.removeAll(keepingCapacity: true)
+                self.renderLeadSamples.removeAll(keepingCapacity: true)
+                self.schedulerWakeLatenessSamples.removeAll(keepingCapacity: true)
+                self.playoutDelayMilliseconds = self.initialPlayoutDelayMilliseconds
+            }
             self.midpointLateBySamples.removeAll(keepingCapacity: true)
             self.signatureCompareTimeSamples.removeAll(keepingCapacity: true)
-            self.playoutDelayMilliseconds = 95.0
             self.lastDelayDecreaseUptime = ProcessInfo.processInfo.systemUptime
             self.sourceSlotCount = 0
             self.midpointSlotCount = 0
