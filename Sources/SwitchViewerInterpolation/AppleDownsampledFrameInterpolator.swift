@@ -2,7 +2,27 @@ import CoreMedia
 import CoreVideo
 import Foundation
 import Metal
+import QuartzCore
 import VideoToolbox
+
+private struct NV12ResizeMetrics {
+    let encodeCPUMilliseconds: Double
+    let commitToGPUStartMilliseconds: Double
+    let gpuExecutionMilliseconds: Double
+    let commitToCompleteMilliseconds: Double
+
+    static let zero = NV12ResizeMetrics(encodeCPUMilliseconds: 0,
+                                        commitToGPUStartMilliseconds: 0,
+                                        gpuExecutionMilliseconds: 0,
+                                        commitToCompleteMilliseconds: 0)
+
+    static func + (lhs: Self, rhs: Self) -> Self {
+        Self(encodeCPUMilliseconds: lhs.encodeCPUMilliseconds + rhs.encodeCPUMilliseconds,
+             commitToGPUStartMilliseconds: lhs.commitToGPUStartMilliseconds + rhs.commitToGPUStartMilliseconds,
+             gpuExecutionMilliseconds: lhs.gpuExecutionMilliseconds + rhs.gpuExecutionMilliseconds,
+             commitToCompleteMilliseconds: lhs.commitToCompleteMilliseconds + rhs.commitToCompleteMilliseconds)
+    }
+}
 
 /// Runs Apple's temporal interpolator on a full-frame 1080p proxy.
 /// The renderer scales the generated proxy to the display drawable directly;
@@ -13,7 +33,12 @@ public final class AppleDownsampledFrameInterpolator {
         public let pixelBuffer: CVPixelBuffer
         public let processingMilliseconds: Double
         public let resizeMilliseconds: Double
+        public let resizeEncodeCPUMilliseconds: Double
+        public let resizeCommitToGPUStartMilliseconds: Double
+        public let resizeGPUExecutionMilliseconds: Double
+        public let resizeCommitToCompleteMilliseconds: Double
         public let processorMilliseconds: Double
+        public let interpolationSubmitToReadyMilliseconds: Double
         public let outputWidth: Int
         public let outputHeight: Int
         public let proxyCacheHits: Int
@@ -142,11 +167,14 @@ public final class AppleDownsampledFrameInterpolator {
             ? currentPresentationTimeStamp : nil
 
         let start = ProcessInfo.processInfo.systemUptime
-        let (proxyPrevious, previousWasCached) = try proxyPixelBuffer(
+        let proxyPreviousResult = try proxyPixelBuffer(
             from: previous, presentationTimeStamp: previousPresentationTimeStamp)
-        let (proxyCurrent, currentWasCached) = try proxyPixelBuffer(
+        let proxyCurrentResult = try proxyPixelBuffer(
             from: current, presentationTimeStamp: currentPresentationTimeStamp)
+        let proxyPrevious = proxyPreviousResult.pixelBuffer
+        let proxyCurrent = proxyCurrentResult.pixelBuffer
         let proxyEnd = ProcessInfo.processInfo.systemUptime
+        let resizeMetrics = proxyPreviousResult.metrics + proxyCurrentResult.metrics
 
         let midpoint = CMTimeAdd(previousPresentationTimeStamp,
             CMTimeMultiplyByFloat64(CMTimeSubtract(currentPresentationTimeStamp,
@@ -195,33 +223,48 @@ public final class AppleDownsampledFrameInterpolator {
         return Result(pixelBuffer: proxyOutput,
                       processingMilliseconds: (end - start) * 1_000,
                       resizeMilliseconds: (proxyEnd - start) * 1_000,
+                      resizeEncodeCPUMilliseconds: resizeMetrics.encodeCPUMilliseconds,
+                      resizeCommitToGPUStartMilliseconds: resizeMetrics.commitToGPUStartMilliseconds,
+                      resizeGPUExecutionMilliseconds: resizeMetrics.gpuExecutionMilliseconds,
+                      resizeCommitToCompleteMilliseconds: resizeMetrics.commitToCompleteMilliseconds,
                       processorMilliseconds: (processorEnd - proxyEnd) * 1_000,
+                      interpolationSubmitToReadyMilliseconds: (processorEnd - proxyEnd) * 1_000,
                       outputWidth: CVPixelBufferGetWidth(proxyOutput),
                       outputHeight: CVPixelBufferGetHeight(proxyOutput),
-                      proxyCacheHits: (previousWasCached ? 1 : 0) + (currentWasCached ? 1 : 0),
-                      proxyCacheMisses: (previousWasCached ? 0 : 1) + (currentWasCached ? 0 : 1))
+                      proxyCacheHits: (proxyPreviousResult.wasCached ? 1 : 0)
+                        + (proxyCurrentResult.wasCached ? 1 : 0),
+                      proxyCacheMisses: (proxyPreviousResult.wasCached ? 0 : 1)
+                        + (proxyCurrentResult.wasCached ? 0 : 1))
+    }
+
+    private struct ProxyResult {
+        let pixelBuffer: CVPixelBuffer
+        let wasCached: Bool
+        let metrics: NV12ResizeMetrics
     }
 
     private func proxyPixelBuffer(from source: CVPixelBuffer,
-                                  presentationTimeStamp: CMTime) throws -> (CVPixelBuffer, Bool) {
+                                  presentationTimeStamp: CMTime) throws -> ProxyResult {
         if isNumeric(presentationTimeStamp),
            let cacheIndex = proxyCache.firstIndex(where: {
                CMTimeCompare($0.presentationTimeStamp, presentationTimeStamp) == 0
            }) {
             let cached = proxyCache.remove(at: cacheIndex)
             proxyCache.append(cached)
-            return (cached.pixelBuffer, true)
+            return ProxyResult(pixelBuffer: cached.pixelBuffer, wasCached: true, metrics: .zero)
         }
 
-        let proxy = try makePixelBuffer(from: source, pool: proxyInputPool)
-        guard isNumeric(presentationTimeStamp) else { return (proxy, false) }
+        let (proxy, metrics) = try makePixelBuffer(from: source, pool: proxyInputPool)
+        guard isNumeric(presentationTimeStamp) else {
+            return ProxyResult(pixelBuffer: proxy, wasCached: false, metrics: metrics)
+        }
 
         proxyCache.append(CachedProxyFrame(presentationTimeStamp: presentationTimeStamp,
                                            pixelBuffer: proxy))
         if proxyCache.count > proxyCacheCapacity {
             proxyCache.removeFirst(proxyCache.count - proxyCacheCapacity)
         }
-        return (proxy, false)
+        return ProxyResult(pixelBuffer: proxy, wasCached: false, metrics: metrics)
     }
 
     private func isNumeric(_ time: CMTime) -> Bool {
@@ -229,15 +272,15 @@ public final class AppleDownsampledFrameInterpolator {
     }
 
     private func makePixelBuffer(from source: CVPixelBuffer,
-                                 pool: CVPixelBufferPool) throws -> CVPixelBuffer {
+                                 pool: CVPixelBufferPool) throws -> (CVPixelBuffer, NV12ResizeMetrics) {
         var destination: CVPixelBuffer?
         let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &destination)
         guard status == kCVReturnSuccess, let destination else {
             throw InterpolationError.pixelBufferPool(status)
         }
-        try scaler.scale(source, into: destination)
+        let metrics = try scaler.scale(source, into: destination)
         CVBufferPropagateAttachments(source, destination)
-        return destination
+        return (destination, metrics)
     }
 
     private static func makePool(attributes: [String: Any]) throws -> CVPixelBufferPool {
@@ -334,13 +377,14 @@ private final class NV12Scaler {
         self.textureCache = cache
     }
 
-    func scale(_ source: CVPixelBuffer, into destination: CVPixelBuffer) throws {
+    func scale(_ source: CVPixelBuffer, into destination: CVPixelBuffer) throws -> NV12ResizeMetrics {
         guard CVPixelBufferGetPixelFormatType(source) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
               CVPixelBufferGetPixelFormatType(destination) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
               CVPixelBufferGetPlaneCount(source) == 2,
               CVPixelBufferGetPlaneCount(destination) == 2 else {
             throw ScalingError.invalidFormat
         }
+        let encodeStart = CACurrentMediaTime()
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { throw ScalingError.commandBuffer }
         var textures: [CVMetalTexture] = []
         for plane in 0..<2 {
@@ -376,12 +420,23 @@ private final class NV12Scaler {
             encoder.dispatchThreads(grid, threadsPerThreadgroup: group)
             encoder.endEncoding()
         }
+        let commitTime = CACurrentMediaTime()
         withExtendedLifetime(textures) {
             commandBuffer.commit()
             commandBuffer.waitUntilCompleted()
         }
+        let completedTime = CACurrentMediaTime()
         if let error = commandBuffer.error {
             throw ScalingError.commandExecution(error.localizedDescription)
         }
+        let gpuStart = commandBuffer.gpuStartTime
+        let gpuEnd = commandBuffer.gpuEndTime
+        return NV12ResizeMetrics(
+            encodeCPUMilliseconds: max(0, commitTime - encodeStart) * 1_000,
+            commitToGPUStartMilliseconds: gpuStart > 0
+                ? max(0, gpuStart - commitTime) * 1_000 : 0,
+            gpuExecutionMilliseconds: gpuStart > 0 && gpuEnd >= gpuStart
+                ? (gpuEnd - gpuStart) * 1_000 : 0,
+            commitToCompleteMilliseconds: max(0, completedTime - commitTime) * 1_000)
     }
 }

@@ -189,3 +189,9 @@
 - 当前进程的 20 个三秒窗口显示，采集时间戳到上屏与采集回调到上屏的 P50 差约 28ms；但此前没有逐帧记录“采集 PTS→delegate 回调”，无法判断这段差值在 CoreMediaIO 交付还是样本处理。
 - 将 `AVCaptureVideoDataOutput` delegate 使用的串行 `framesQueue` 提升到 `.userInteractive`，并新增每三秒的 `ptsToCallback` 与 `callbackWork` P50/P95 统计。插帧算法、输入尺寸、呈现队列和按节奏 pacing 均未改。
 - Release 构建成功，新版 app 已安装并通过严格签名校验。PID 84403 仍运行缓存版旧代码；退出并重开后检查启动日志中的 `captureCallbackQueueQoS=userInteractive`，再比较 PTS→回调、回调处理耗时以及 callback→display。更新前 app bundle 保存在 `Artifacts/SwitchViewer-running-pre-capture-qos-20260928.app`。
+
+## 2026-09-28：拆分代理缩放与插帧计时
+
+- 保持插帧与上屏行为不变，为每次 4K→1080p NV12 缩放增加 command buffer 编码 CPU、提交到 GPU 开始、GPU 执行、提交到完成及 resize 总墙钟计时。当前 scaler 每次只提交 resize 命令，因此这一阶段的 `resizeGPU` 对应 resize command buffer 的 GPU 执行区间。
+- 插帧日志新增 `interpolationSubmitToReady`，与 `resizeWall` 分开；cache 命中不伪造 resize 计时，按每个 3 秒窗口的 P50/P95 报告各阶段数据。
+- `swift build -c release` 通过。尚未重启实时采集进程，新指标待新版运行后读取；此阶段只验证编译和计时接线，不据此声称性能已改善。

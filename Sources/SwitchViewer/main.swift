@@ -563,6 +563,12 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let cadenceMilliseconds: Double
         let queueMilliseconds: Double
         let preprocessingMilliseconds: Double
+        let resizeEncodeCPUMilliseconds: Double
+        let resizeCommitToGPUStartMilliseconds: Double
+        let resizeGPUExecutionMilliseconds: Double
+        let resizeCommitToCompleteMilliseconds: Double
+        let resizeWallMilliseconds: Double
+        let interpolationSubmitToReadyMilliseconds: Double
         let opticalFlowMilliseconds: Double
         let synthesisMilliseconds: Double
         let providerMilliseconds: Double
@@ -829,6 +835,12 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         cadenceMilliseconds: input.cadenceMilliseconds,
                         queueMilliseconds: queueMilliseconds,
                         preprocessingMilliseconds: result?.resizeMilliseconds ?? 0,
+                        resizeEncodeCPUMilliseconds: result?.resizeEncodeCPUMilliseconds ?? 0,
+                        resizeCommitToGPUStartMilliseconds: result?.resizeCommitToGPUStartMilliseconds ?? 0,
+                        resizeGPUExecutionMilliseconds: result?.resizeGPUExecutionMilliseconds ?? 0,
+                        resizeCommitToCompleteMilliseconds: result?.resizeCommitToCompleteMilliseconds ?? 0,
+                        resizeWallMilliseconds: result?.resizeMilliseconds ?? 0,
+                        interpolationSubmitToReadyMilliseconds: result?.interpolationSubmitToReadyMilliseconds ?? 0,
                         opticalFlowMilliseconds: 0,
                         synthesisMilliseconds: 0,
                         providerMilliseconds: providerMilliseconds,
@@ -894,6 +906,12 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         cadenceMilliseconds: input.cadenceMilliseconds,
                         queueMilliseconds: queueMilliseconds,
                         preprocessingMilliseconds: result?.preprocessingMilliseconds ?? 0,
+                        resizeEncodeCPUMilliseconds: 0,
+                        resizeCommitToGPUStartMilliseconds: 0,
+                        resizeGPUExecutionMilliseconds: 0,
+                        resizeCommitToCompleteMilliseconds: 0,
+                        resizeWallMilliseconds: 0,
+                        interpolationSubmitToReadyMilliseconds: 0,
                         opticalFlowMilliseconds: result?.opticalFlowMilliseconds ?? 0,
                         synthesisMilliseconds: result?.synthesisMilliseconds ?? 0,
                         providerMilliseconds: providerMilliseconds,
@@ -966,6 +984,12 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                     cadenceMilliseconds: input.cadenceMilliseconds,
                     queueMilliseconds: queueMilliseconds,
                     preprocessingMilliseconds: 0,
+                    resizeEncodeCPUMilliseconds: 0,
+                    resizeCommitToGPUStartMilliseconds: 0,
+                    resizeGPUExecutionMilliseconds: 0,
+                    resizeCommitToCompleteMilliseconds: 0,
+                    resizeWallMilliseconds: 0,
+                    interpolationSubmitToReadyMilliseconds: providerMilliseconds,
                     opticalFlowMilliseconds: 0,
                     synthesisMilliseconds: 0,
                     providerMilliseconds: providerMilliseconds,
@@ -1044,7 +1068,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             }
             let proxyCacheHits = values.reduce(0) { $0 + $1.proxyCacheHits }
             let proxyCacheMisses = values.reduce(0) { $0 + $1.proxyCacheMisses }
-            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); preprocess=\(range(\.preprocessingMilliseconds)); proxyCache=\(proxyCacheHits)/\(proxyCacheMisses); apple=\(range(\.appleFrameProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
+            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); resizeEncodeCPU=\(range(\.resizeEncodeCPUMilliseconds)); resizeQueueWait=\(range(\.resizeCommitToGPUStartMilliseconds)); resizeGPU=\(range(\.resizeGPUExecutionMilliseconds)); resizeCommitToComplete=\(range(\.resizeCommitToCompleteMilliseconds)); resizeWall=\(range(\.resizeWallMilliseconds)); proxyCache=\(proxyCacheHits)/\(proxyCacheMisses); interpolationSubmitToReady=\(range(\.interpolationSubmitToReadyMilliseconds)); apple=\(range(\.appleFrameProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
         }
         timingSamples.removeAll(keepingCapacity: true)
     }
