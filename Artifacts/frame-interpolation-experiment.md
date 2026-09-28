@@ -215,3 +215,11 @@
 - `FrameInterpolationCompletion` 不再把输入 source buffer 作为插帧结果返回。输入 source 由采集回调持有；插帧器只交付 midpoint、错误和帧间隔，避免调用方误把 source 生命周期/上屏决定交给插帧器。
 - 为保证这一阶段可运行，旧呈现策略暂由采集回调把自己持有的 source 传给原有配对适配器；上屏时机尚未改变，source 与 midpoint 的调度解耦留到下一阶段。
 - `swift build -c release` 通过；尚未运行实时 A/B。
+
+## 2026-09-28：按媒体时间戳调度 30→60 输出
+
+- 新增可切换的“按媒体时间戳定时（实验）”策略，默认仍是原呈现方式。仅当 4K Apple 代理插帧开启且 cadence detector 稳定识别约 30fps 时，source 才立即独立进入 scheduler；其他节奏继续走旧路径。离开稳定 30fps、切换模式/格式或关闭插帧时会重置 epoch 和待排时隙。
+- scheduler 按 source 与 midpoint 的媒体 host time 合并到同一 60Hz slot；完全相同的重复 source 可由准时 midpoint 顶替，任何 NV12 像素变化（包括 HUD/UI）都保留 source 优先。重复 source 已经显示后会保持现有 drawable，不重复重画；midpoint 错过 ready deadline 会被丢弃，尚未显示的 source 可及时顶上。
+- 呈现目标用 `present(drawable, atTime:)`，Dispatch timer 在 target 前按观测到的 renderer P99 lead 和 scheduler wake P99 加动态安全量唤醒；不会忙等，也不会提前占住 drawable。初始 playout delay 为 95ms，再依据 ready 相对 midpoint PTS 的 P99 逐步上调/缓慢收敛。
+- 新增 scheduler slot、midpoint late-by P50/P95/P99、source fallback、source 优先覆盖、完整 NV12 对比、playout delay、renderer lead、timer lateness 和动态 safety 诊断。上屏分段日志现在输出 P50/P95/P99 与 target-to-presented。
+- 此阶段仍用异步完整 NV12 比较来严格判断重复帧；高分辨率比较的成本尚待观测，后续签名采样阶段再评估替换。`swift build -c release` 通过；默认行为未切换，真实采集场景 A/B 尚未完成。

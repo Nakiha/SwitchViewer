@@ -11,14 +11,20 @@ import SwitchViewerInterpolation
 
 private let maximumPresentationInFlightFrames = 3
 
+func presentationHostTimeNow() -> CFTimeInterval {
+    CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+}
+
 enum PresentationPacingMode: Int, CaseIterable {
     case displayDriven = 0
     case cadenceLimited = 1
+    case deadlineScheduled = 2
 
     var label: String {
         switch self {
         case .displayDriven: return "尽快呈现（低时延实验）"
         case .cadenceLimited: return "按检测节奏限速（原方式）"
+        case .deadlineScheduled: return "按媒体时间戳定时（实验）"
         }
     }
 
@@ -229,6 +235,7 @@ final class MetalRenderer {
     func encode(pixelBuffer pb: CVPixelBuffer, to target: MTLTexture,
                 scale: SIMD2<Float>, present drawable: MTLDrawable?,
                 minimumPresentationDuration: TimeInterval? = nil,
+                targetPresentationHostTime: CFTimeInterval? = nil,
                 onPresented: ((CFTimeInterval) -> Void)? = nil,
                 onCommandBufferCommitted: (() -> Void)? = nil,
                 onGPUCompleted: (() -> Void)? = nil) -> String? {
@@ -267,7 +274,9 @@ final class MetalRenderer {
                     onPresented(drawable.presentedTime)
                 }
             }
-            if let duration = minimumPresentationDuration, duration > 0 {
+            if let targetPresentationHostTime, targetPresentationHostTime > 0 {
+                buf.present(d, atTime: targetPresentationHostTime)
+            } else if let duration = minimumPresentationDuration, duration > 0 {
                 buf.present(d, afterMinimumDuration: duration)
             } else {
                 buf.present(d)
@@ -281,6 +290,7 @@ final class MetalRenderer {
     /// 成功返回 (true, nil)；失败返回 (false, 原因)
     func render(pixelBuffer pb: CVPixelBuffer,
                 minimumPresentationDuration: TimeInterval? = nil,
+                targetPresentationHostTime: CFTimeInterval? = nil,
                 onPresented: ((CFTimeInterval) -> Void)? = nil,
                 onDrawableWaitStarted: (() -> Void)? = nil,
                 onDrawableAcquired: (() -> Void)? = nil,
@@ -311,6 +321,7 @@ final class MetalRenderer {
         if let err = encode(pixelBuffer: pb, to: drawable.texture, scale: scale,
                             present: drawable,
                             minimumPresentationDuration: minimumPresentationDuration,
+                            targetPresentationHostTime: targetPresentationHostTime,
                             onPresented: onPresented,
                             onCommandBufferCommitted: onCommandBufferCommitted,
                             onGPUCompleted: onGPUCompleted) {
@@ -413,12 +424,12 @@ final class PresentationFrameTiming {
     private var hostTimes: [Stage: CFTimeInterval]
 
     init(captureCallbackHostTime: CFTimeInterval,
-         processingReadyHostTime: CFTimeInterval = ProcessInfo.processInfo.systemUptime) {
+         processingReadyHostTime: CFTimeInterval = presentationHostTimeNow()) {
         self.captureCallbackHostTime = captureCallbackHostTime
         hostTimes = [.processingReady: processingReadyHostTime]
     }
 
-    func mark(_ stage: Stage, at hostTime: CFTimeInterval = ProcessInfo.processInfo.systemUptime) {
+    func mark(_ stage: Stage, at hostTime: CFTimeInterval = presentationHostTimeNow()) {
         lock.lock()
         hostTimes[stage] = hostTime
         lock.unlock()
@@ -496,7 +507,27 @@ struct PresentationFrame {
     let isInterpolated: Bool
     let minimumPresentationDuration: TimeInterval?
     let presentationTimestampHostTime: CFTimeInterval?
+    let targetPresentationHostTime: CFTimeInterval?
+    let sourceID: UInt64?
+    let sourceContentRootID: UInt64?
     let timing: PresentationFrameTiming
+
+    init(pixelBuffer: CVPixelBuffer, isInterpolated: Bool,
+         minimumPresentationDuration: TimeInterval?,
+         presentationTimestampHostTime: CFTimeInterval?,
+         targetPresentationHostTime: CFTimeInterval? = nil,
+         sourceID: UInt64? = nil,
+         sourceContentRootID: UInt64? = nil,
+         timing: PresentationFrameTiming) {
+        self.pixelBuffer = pixelBuffer
+        self.isInterpolated = isInterpolated
+        self.minimumPresentationDuration = minimumPresentationDuration
+        self.presentationTimestampHostTime = presentationTimestampHostTime
+        self.targetPresentationHostTime = targetPresentationHostTime
+        self.sourceID = sourceID
+        self.sourceContentRootID = sourceContentRootID
+        self.timing = timing
+    }
 }
 
 protocol FrameInterpolationEngine: AnyObject {
@@ -583,6 +614,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
     private var processor = VTFrameProcessor()
     private let cadenceDetector = SwitchFrameCadenceDetector()
     private let onRepeatedGameFrameSkipped: () -> Void
+    private let onCadenceChanged: (Double?) -> Void
     private let onQueuedFramesDropped: (Int) -> Void
     private let onBackendChanged: (String) -> Void
     private let onTimingReport: (String) -> Void
@@ -610,10 +642,12 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
     private var mode: FrameInterpolationMode = .opticalFlow
 
     init(onRepeatedGameFrameSkipped: @escaping () -> Void = {},
+         onCadenceChanged: @escaping (Double?) -> Void = { _ in },
          onQueuedFramesDropped: @escaping (Int) -> Void = { _ in },
          onBackendChanged: @escaping (String) -> Void = { _ in },
          onTimingReport: @escaping (String) -> Void = { _ in }) {
         self.onRepeatedGameFrameSkipped = onRepeatedGameFrameSkipped
+        self.onCadenceChanged = onCadenceChanged
         self.onQueuedFramesDropped = onQueuedFramesDropped
         self.onBackendChanged = onBackendChanged
         self.onTimingReport = onTimingReport
@@ -657,6 +691,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             cadenceDetector.reset()
             cadence = nil
         }
+        onCadenceChanged(cadence?.gameFPS)
         let cadenceMilliseconds = (ProcessInfo.processInfo.systemUptime - cadenceStart) * 1_000
 
         let previousCapturedFrame = recentCaptureFrames.last
@@ -709,6 +744,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             self.timingSamples.removeAll(keepingCapacity: true)
             self.lastTimingReportUptime = ProcessInfo.processInfo.systemUptime
             self.cadenceDetector.reset()
+            self.onCadenceChanged(nil)
             self.appleProxyInterpolator = nil
             if self.isProcessing {
                 self.resetAfterCurrent = true
@@ -733,6 +769,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             self.timingSamples.removeAll(keepingCapacity: true)
             self.lastTimingReportUptime = ProcessInfo.processInfo.systemUptime
             self.cadenceDetector.reset()
+            self.onCadenceChanged(nil)
             self.activeBackend = nil
             self.appleProxyInterpolator = nil
             self.processingDisabledError = nil
@@ -1160,6 +1197,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let drawableToCommitMilliseconds: Double?
         let gpuSubmitToCompleteMilliseconds: Double?
         let gpuCompleteToDisplayMilliseconds: Double?
+        let targetToPresentedMilliseconds: Double?
     }
 
     var window: NSWindow!
@@ -1245,6 +1283,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var presentationPacingMode = PresentationPacingMode.cadenceLimited
     var presentationPacingMenuItems: [NSMenuItem] = []
     var frameInterpolationEngine: FrameInterpolationEngine?
+    var detectedGameFPS: Double?
+    var nextSourceFrameID: UInt64 = 0
+    lazy var presentationScheduler = PresentationScheduler(
+        onFrame: { [weak self] frame, epoch in
+            guard let self else { return }
+            self.enqueuePresentationFrames([frame], epoch: epoch, requireInterpolation: true)
+        },
+        onReport: { [weak self] report in self?.diagnosticLog.append(report) })
     var frameInterpolationEnabled = false
     var frameInterpolationUnavailable = false
     var frameInterpolationEpoch = 0
@@ -1359,10 +1405,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard self.fallbackLayer == nil else { return }
             self.frameLock.lock()
             self.frameInterpolationEpoch += 1
+            let epoch = self.frameInterpolationEpoch
             self.frameInterpolationEnabled = false
             self.frameInterpolationMenuItem?.state = .off
             let interpolationEngine = self.frameInterpolationEngine
             self.frameLock.unlock()
+            self.presentationScheduler.reset(epoch: epoch)
             interpolationEngine?.reset()
             let l = AVCaptureVideoPreviewLayer(session: self.session)
             l.videoGravity = .resizeAspect
@@ -1863,12 +1911,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func startSession(video: AVCaptureDevice, formatIndex: Int) {
         frameLock.lock()
         frameInterpolationEpoch += 1
+        let epoch = frameInterpolationEpoch
         let interpolationEngine = frameInterpolationEngine
         interpolatedFrameCount = 0
         interpolationRepeatedFrameSkipCount = 0
         interpolationFailureCount = 0
         lastInterpolationError = nil
         frameLock.unlock()
+        presentationScheduler.reset(epoch: epoch)
         interpolationEngine?.reset()
         let opt = formatOptions.indices.contains(formatIndex) ? formatOptions[formatIndex] : nil
         let requested = opt?.label ?? "未知格式[\(formatIndex)]"
@@ -2144,11 +2194,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 return
             }
         }
+        frameLock.lock()
+        guard frameInterpolationMode != mode else {
+            frameLock.unlock()
+            return
+        }
         frameInterpolationMode = mode
+        frameInterpolationEpoch += 1
+        let epoch = frameInterpolationEpoch
+        lastAcceptedSourceBuffer = nil
+        let engine = frameInterpolationEngine
+        frameLock.unlock()
+        presentationScheduler.reset(epoch: epoch)
+        engine?.setMode(mode)
         for item in frameInterpolationModeMenuItems {
             item.state = item.tag == mode.rawValue ? .on : .off
         }
-        frameInterpolationEngine?.setMode(mode)
         diagnosticLog.append("插帧方式切换; mode=\(mode.label)")
         setStatus("插帧方式：\(mode.label)", base: false)
     }
@@ -2156,8 +2217,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func selectPresentationPacing(_ sender: NSMenuItem) {
         guard let mode = PresentationPacingMode(rawValue: sender.tag) else { return }
         frameLock.lock()
+        guard presentationPacingMode != mode else {
+            frameLock.unlock()
+            return
+        }
         presentationPacingMode = mode
+        frameInterpolationEpoch += 1
+        let epoch = frameInterpolationEpoch
         frameLock.unlock()
+        presentationScheduler.reset(epoch: epoch)
         for item in presentationPacingMenuItems {
             item.state = item.tag == mode.rawValue ? .on : .off
         }
@@ -2215,6 +2283,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         self.interpolationRepeatedFrameSkipCount += 1
                         self.frameLock.unlock()
                     },
+                    onCadenceChanged: { [weak self] gameFPS in
+                        guard let self else { return }
+                        self.frameLock.lock()
+                        let changed = self.detectedGameFPS != gameFPS
+                        let wasDeadlineCadence = self.detectedGameFPS.map {
+                            abs($0 - 30) <= 2
+                        } ?? false
+                        self.detectedGameFPS = gameFPS
+                        let isDeadlineCadence = gameFPS.map { abs($0 - 30) <= 2 } ?? false
+                        let shouldResetScheduler = wasDeadlineCadence && !isDeadlineCadence
+                            && self.presentationPacingMode == .deadlineScheduled
+                            && self.frameInterpolationMode == .appleLowLatency4KProxy
+                        if shouldResetScheduler { self.frameInterpolationEpoch += 1 }
+                        let schedulerEpoch = self.frameInterpolationEpoch
+                        self.frameLock.unlock()
+                        if shouldResetScheduler {
+                            self.presentationScheduler.reset(epoch: schedulerEpoch)
+                            self.diagnosticLog.append(
+                                "deadline scheduler reset; 原因=30fps 节奏不再稳定")
+                        }
+                        if changed {
+                            self.diagnosticLog.append(
+                                "游戏节奏状态; gameFPS=\(gameFPS.map { String(format: "%.1f", $0) } ?? "未知")")
+                        }
+                    },
                     onQueuedFramesDropped: { [weak self] count in
                         guard let self else { return }
                         self.frameLock.lock()
@@ -2239,10 +2332,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let newEngine { frameInterpolationEngine = newEngine }
         frameInterpolationEnabled = shouldEnable
         frameInterpolationEpoch += 1
+        let epoch = frameInterpolationEpoch
         lastAcceptedSourceBuffer = nil
         frameInterpolationMenuItem.state = shouldEnable ? .on : .off
         let activeEngine = frameInterpolationEngine
         frameLock.unlock()
+        presentationScheduler.reset(epoch: epoch)
         activeEngine?.reset()
 
         let message = shouldEnable
@@ -2472,7 +2567,16 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             gpuSubmitToCompleteMilliseconds: timing.milliseconds(from: .commandBufferSubmitStarted,
                                                                 to: .gpuCompleted),
             gpuCompleteToDisplayMilliseconds: wasPresented
-                ? timing.milliseconds(from: .gpuCompleted, toHostTime: presentedTime) : nil)
+                ? timing.milliseconds(from: .gpuCompleted, toHostTime: presentedTime) : nil,
+            targetToPresentedMilliseconds: wasPresented
+                ? frame.targetPresentationHostTime.map { (presentedTime - $0) * 1_000 } : nil)
+        if wasPresented, frame.sourceID != nil {
+            presentationScheduler.recordSourcePresented(
+                frame.sourceID, contentRootID: frame.sourceContentRootID)
+        }
+        if let lead = timing.milliseconds(from: .presentationQueueStarted, to: .gpuCompleted) {
+            presentationScheduler.recordRendererLead(lead)
+        }
         displayTimingQueue.async {
             self.displayTimingSamples.append(sample)
             let now = ProcessInfo.processInfo.systemUptime
@@ -2491,8 +2595,9 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             }
             func range(_ values: [Double]) -> String {
                 guard let p50 = percentile(values, 0.50),
-                      let p95 = percentile(values, 0.95) else { return "无" }
-                return String(format: "%.1f/%.1f", p50, p95)
+                      let p95 = percentile(values, 0.95),
+                      let p99 = percentile(values, 0.99) else { return "无" }
+                return String(format: "%.1f/%.1f/%.1f", p50, p95, p99)
             }
             func stageRange(_ keyPath: KeyPath<DisplayLatencySample, Double?>,
                             in values: [DisplayLatencySample]) -> String {
@@ -2506,7 +2611,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                 let callbackLatency = shown.compactMap(\.callbackToDisplayMilliseconds)
                 let mediaLatency = shown.compactMap(\.mediaTimestampToDisplayMilliseconds)
                 self.diagnosticLog.append(
-                    "实际上屏分段 P50/P95 ms; frame=\(isInterpolated ? "插值帧" : "采集帧"); samples=\(group.count); presented=\(shown.count); callbackToDisplay=\(range(callbackLatency)); mediaTimestampToDisplay=\(range(mediaLatency)); callbackToReady=\(stageRange(\.callbackToReadyMilliseconds, in: group)); readyToEnqueue=\(stageRange(\.readyToPresentationEnqueueMilliseconds, in: group)); presentationQueueWait=\(stageRange(\.presentationQueueWaitMilliseconds, in: group)); queueStartToDrawable(includesNextDrawableWait)=\(stageRange(\.queueStartToDrawableMilliseconds, in: group)); nextDrawableWait=\(stageRange(\.drawableWaitMilliseconds, in: group)); drawableToSubmit=\(stageRange(\.drawableToCommitMilliseconds, in: group)); gpuSubmitToComplete=\(stageRange(\.gpuSubmitToCompleteMilliseconds, in: group)); gpuCompleteToDisplay=\(stageRange(\.gpuCompleteToDisplayMilliseconds, in: group))")
+                    "实际上屏分段 P50/P95/P99 ms; frame=\(isInterpolated ? "插值帧" : "采集帧"); samples=\(group.count); presented=\(shown.count); callbackToDisplay=\(range(callbackLatency)); mediaTimestampToDisplay=\(range(mediaLatency)); callbackToReady=\(stageRange(\.callbackToReadyMilliseconds, in: group)); readyToEnqueue=\(stageRange(\.readyToPresentationEnqueueMilliseconds, in: group)); presentationQueueWait=\(stageRange(\.presentationQueueWaitMilliseconds, in: group)); queueStartToDrawable(includesNextDrawableWait)=\(stageRange(\.queueStartToDrawableMilliseconds, in: group)); nextDrawableWait=\(stageRange(\.drawableWaitMilliseconds, in: group)); drawableToSubmit=\(stageRange(\.drawableToCommitMilliseconds, in: group)); gpuSubmitToComplete=\(stageRange(\.gpuSubmitToCompleteMilliseconds, in: group)); gpuCompleteToDisplay=\(stageRange(\.gpuCompleteToDisplayMilliseconds, in: group)); targetToPresented=\(stageRange(\.targetToPresentedMilliseconds, in: group))")
             }
         }
     }
@@ -2552,7 +2657,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         guard let pb = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let captureCallbackHostTime = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+        let captureCallbackHostTime = presentationHostTimeNow()
         let presentationTimestampHostTime = hostTime(forCaptureTimestamp: presentationTimeStamp)
         if let presentationTimestampHostTime,
            captureCallbackHostTime >= presentationTimestampHostTime {
@@ -2569,6 +2674,9 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         lastFrameDate = Date()
         let interpolationEnabled = frameInterpolationEnabled
         let interpolationEngine = frameInterpolationEngine
+        let interpolationMode = frameInterpolationMode
+        let pacingMode = presentationPacingMode
+        let detectedGameFPS = self.detectedGameFPS
         let epoch = frameInterpolationEpoch
         frameLock.unlock()
         if changed {
@@ -2595,7 +2703,58 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                 }
             }
         }
-        if interpolationEnabled, let interpolationEngine {
+        if interpolationEnabled,
+           interpolationMode == .appleLowLatency4KProxy,
+           pacingMode == .deadlineScheduled,
+           let detectedGameFPS, abs(detectedGameFPS - 30) <= 2,
+           let interpolationEngine,
+           let presentationTimestampHostTime {
+            frameLock.lock()
+            nextSourceFrameID &+= 1
+            let sourceID = nextSourceFrameID
+            frameLock.unlock()
+            presentationScheduler.offerSource(CapturedSourceFrame(
+                id: sourceID,
+                pixelBuffer: pb,
+                presentationTimeStamp: presentationTimeStamp,
+                mediaHostTime: presentationTimestampHostTime,
+                captureCallbackHostTime: captureCallbackHostTime,
+                epoch: epoch))
+            let interpolationSubmittedHostTime = presentationHostTimeNow()
+            interpolationEngine.submit(pb,
+                                       presentationTimeStamp: presentationTimeStamp) {
+                [weak self] generated, error, halfInterval in
+                guard let self else { return }
+                if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
+                    self.recordInterpolationFailure(error)
+                }
+                guard self.canPresentFrame(epoch: epoch, requireInterpolation: true),
+                      let generated,
+                      let halfInterval, halfInterval > 0 else { return }
+                let midpointPresentationTimeStamp = CMTimeSubtract(
+                    presentationTimeStamp,
+                    CMTime(seconds: halfInterval, preferredTimescale: 60_000))
+                guard let midpointHostTime = self.hostTime(
+                    forCaptureTimestamp: midpointPresentationTimeStamp) else {
+                    self.diagnosticLog.append("deadline 插值帧丢弃; 原因=媒体时间戳无法转换到 host time")
+                    return
+                }
+                let previousSourcePresentationTimeStamp = CMTimeSubtract(
+                    midpointPresentationTimeStamp,
+                    CMTime(seconds: halfInterval, preferredTimescale: 60_000))
+                let readyHostTime = presentationHostTimeNow()
+                self.presentationScheduler.offerMidpoint(InterpolatedFrame(
+                    previousSourcePresentationTimeStamp: previousSourcePresentationTimeStamp,
+                    currentSourceID: sourceID,
+                    pixelBuffer: generated,
+                    mediaPresentationTimeStamp: midpointPresentationTimeStamp,
+                    mediaHostTime: midpointHostTime,
+                    captureCallbackHostTime: captureCallbackHostTime,
+                    submittedHostTime: interpolationSubmittedHostTime,
+                    readyHostTime: readyHostTime,
+                    epoch: epoch))
+            }
+        } else if interpolationEnabled, let interpolationEngine {
             interpolationEngine.submit(pb,
                                        presentationTimeStamp: presentationTimeStamp) {
                 [weak self] generated, error, halfInterval in
@@ -2630,7 +2789,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         let pacingMode = presentationPacingMode
         frameLock.unlock()
         let minimumPresentationDuration = pacingMode.minimumDuration(for: halfInterval)
-        let processingReadyHostTime = ProcessInfo.processInfo.systemUptime
+        let processingReadyHostTime = presentationHostTimeNow()
         if let generated {
             let generatedPresentationTimeStamp: CMTime
             if let halfInterval, halfInterval > 0 {
@@ -2775,10 +2934,12 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             frameInterpolationEpoch += 1
             frameInterpolationUnavailable = true
         }
+        let epoch = frameInterpolationEpoch
         let interpolationEngine = frameInterpolationEngine
         frameLock.unlock()
         if shouldLog { diagnosticLog.append("插帧失败; error=\(message)") }
         if shouldDisable {
+            presentationScheduler.reset(epoch: epoch)
             interpolationEngine?.reset()
             DispatchQueue.main.async {
                 self.frameInterpolationMenuItem?.state = .off
@@ -2814,6 +2975,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         }
         let (ok, err) = r.render(pixelBuffer: frame.pixelBuffer,
                                  minimumPresentationDuration: frame.minimumPresentationDuration,
+                                 targetPresentationHostTime: frame.targetPresentationHostTime,
                                  onPresented: { [weak self] presentedTime in
             self?.recordDisplayPresentation(frame, presentedTime: presentedTime)
             onPresented()
