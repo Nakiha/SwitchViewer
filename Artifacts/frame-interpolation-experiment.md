@@ -201,3 +201,11 @@
 - 将 `NV12Scaler` 和 Metal kernel 移至独立源文件，新增 `encodeScale(source:destination:into:)`。该 API 只校验像素格式、创建 Core Video Metal 纹理并编码 Y/UV compute work，不创建、提交或等待 command buffer。
 - 暂留 `scaleSynchronously` 适配器供当前实时路径使用，故本阶段不改变插帧和呈现行为。纹理包装对象由 command buffer 完成回调强引用到 GPU work 结束。
 - `swift build -c release` 通过；运行时 A/B 尚未执行。
+
+## 2026-09-28：4K 代理插帧异步化
+
+- 将 4K 代理路径改为提交式 API。代理缩放与 `VTFrameProcessor.process(with:parameters:)` 编入同一个 Metal command buffer，由完成回调交付结果；4K 代理实时路径不再调用 `waitUntilCompleted()` 或 semaphore 等待。
+- 新增单 active job 保护；job 强持有原始输入、代理像素缓冲、VT frame、parameters 和输出，直到 command buffer 完成。只在成功完成后把新代理帧放入 PTS cache。
+- 合并 command buffer 报错时，尝试 callback-driven fallback：独立异步缩放 command buffer 完成后，再调用 VideoToolbox 异步 completion-handler 接口。记录 fallback 次数。
+- `FrameInterpolationLab` 使用自身的同步探针包装器等待异步结果；这个等待仅在离线实验工具中，不进入 SwitchViewer 实时 4K 代理路径。
+- 合并路径的 `commandBufferGPU` 覆盖 resize 与 VT effect，不能解释成 resize-only GPU 时间。第一阶段的独立 resize 计时保留作改动前基线。Release 构建通过；尚未在实时采集卡场景运行，API 兼容性和 P50/P95/P99 变化待实机验证。

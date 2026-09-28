@@ -563,19 +563,18 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let cadenceMilliseconds: Double
         let queueMilliseconds: Double
         let preprocessingMilliseconds: Double
-        let resizeEncodeCPUMilliseconds: Double
-        let resizeCommitToGPUStartMilliseconds: Double
-        let resizeGPUExecutionMilliseconds: Double
-        let resizeCommitToCompleteMilliseconds: Double
-        let resizeWallMilliseconds: Double
+        let commandBufferQueueWaitMilliseconds: Double
+        let commandBufferGPUExecutionMilliseconds: Double
+        let commandBufferCommitToCompleteMilliseconds: Double
         let interpolationSubmitToReadyMilliseconds: Double
         let opticalFlowMilliseconds: Double
         let synthesisMilliseconds: Double
         let providerMilliseconds: Double
-        let appleFrameProcessingMilliseconds: Double
+        let appleOrCombinedProcessingMilliseconds: Double
         let captureToReadyMilliseconds: Double
         let proxyCacheHits: Int
         let proxyCacheMisses: Int
+        let usedSplitFallback: Bool
     }
 
     private let queue = DispatchQueue(label: "switchviewer.frame-interpolation")
@@ -812,53 +811,58 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                 return
             }
             isProcessing = true
-            gpuQueue.async {
-                let providerStartUptime = ProcessInfo.processInfo.systemUptime
-                let result: AppleDownsampledFrameInterpolator.Result?
-                let errorMessage: String?
-                do {
-                    result = try interpolator.interpolate(previous: previousBuffer,
-                                                          current: input.buffer,
-                                                          previousPresentationTimeStamp: previousPresentationTimeStamp,
-                                                          currentPresentationTimeStamp: input.presentationTimeStamp)
-                    errorMessage = nil
-                } catch {
-                    result = nil
-                    errorMessage = "Apple 4K 代理插帧失败：\(error.localizedDescription)"
-                }
-                let providerMilliseconds = (ProcessInfo.processInfo.systemUptime - providerStartUptime) * 1_000
-                self.queue.async {
-                    self.recordTiming(TimingSample(
-                        backend: backendLabel,
-                        detectedGameFPS: input.detectedGameFPS,
-                        gameFrameIntervalMilliseconds: CMTimeGetSeconds(interval) * 1_000,
-                        cadenceMilliseconds: input.cadenceMilliseconds,
-                        queueMilliseconds: queueMilliseconds,
-                        preprocessingMilliseconds: result?.resizeMilliseconds ?? 0,
-                        resizeEncodeCPUMilliseconds: result?.resizeEncodeCPUMilliseconds ?? 0,
-                        resizeCommitToGPUStartMilliseconds: result?.resizeCommitToGPUStartMilliseconds ?? 0,
-                        resizeGPUExecutionMilliseconds: result?.resizeGPUExecutionMilliseconds ?? 0,
-                        resizeCommitToCompleteMilliseconds: result?.resizeCommitToCompleteMilliseconds ?? 0,
-                        resizeWallMilliseconds: result?.resizeMilliseconds ?? 0,
-                        interpolationSubmitToReadyMilliseconds: result?.interpolationSubmitToReadyMilliseconds ?? 0,
-                        opticalFlowMilliseconds: 0,
-                        synthesisMilliseconds: 0,
-                        providerMilliseconds: providerMilliseconds,
-                        appleFrameProcessingMilliseconds: result?.processorMilliseconds ?? 0,
-                        captureToReadyMilliseconds: (ProcessInfo.processInfo.systemUptime
-                                                     - input.submittedAtUptime) * 1_000,
-                        proxyCacheHits: result?.proxyCacheHits ?? 0,
-                        proxyCacheMisses: result?.proxyCacheMisses ?? 0))
-                    if let errorMessage {
-                        self.processingDisabledError = errorMessage
-                        input.completion(nil, input.buffer, errorMessage, nil)
-                    } else if let result {
-                        input.completion(result.pixelBuffer, input.buffer, nil, frameDuration)
-                    } else {
-                        input.completion(nil, input.buffer, "Apple 4K 代理插帧没有生成输出帧", nil)
+            let providerStartUptime = ProcessInfo.processInfo.systemUptime
+            do {
+                try interpolator.submit(previous: previousBuffer,
+                                        current: input.buffer,
+                                        previousPresentationTimeStamp: previousPresentationTimeStamp,
+                                        currentPresentationTimeStamp: input.presentationTimeStamp) { result, error in
+                    let providerMilliseconds = result?.processingMilliseconds
+                        ?? (ProcessInfo.processInfo.systemUptime - providerStartUptime) * 1_000
+                    self.queue.async {
+                        let errorMessage = error.map { "Apple 4K 代理插帧失败：\(String(describing: $0))" }
+                        self.recordTiming(TimingSample(
+                            backend: backendLabel,
+                            detectedGameFPS: input.detectedGameFPS,
+                            gameFrameIntervalMilliseconds: CMTimeGetSeconds(interval) * 1_000,
+                            cadenceMilliseconds: input.cadenceMilliseconds,
+                            queueMilliseconds: queueMilliseconds,
+                            preprocessingMilliseconds: result?.proxyEncodeCPUMilliseconds ?? 0,
+                            commandBufferQueueWaitMilliseconds:
+                                result?.commandBufferCommitToGPUStartMilliseconds ?? 0,
+                            commandBufferGPUExecutionMilliseconds:
+                                result?.commandBufferGPUExecutionMilliseconds ?? 0,
+                            commandBufferCommitToCompleteMilliseconds:
+                                result?.commandBufferCommitToCompleteMilliseconds ?? 0,
+                            interpolationSubmitToReadyMilliseconds:
+                                result?.interpolationSubmitToReadyMilliseconds ?? 0,
+                            opticalFlowMilliseconds: 0,
+                            synthesisMilliseconds: 0,
+                            providerMilliseconds: providerMilliseconds,
+                            appleOrCombinedProcessingMilliseconds:
+                                result?.interpolationSubmitToReadyMilliseconds ?? 0,
+                            captureToReadyMilliseconds: (ProcessInfo.processInfo.systemUptime
+                                                         - input.submittedAtUptime) * 1_000,
+                            proxyCacheHits: result?.proxyCacheHits ?? 0,
+                            proxyCacheMisses: result?.proxyCacheMisses ?? 0,
+                            usedSplitFallback: result?.usedSplitFallback ?? false))
+                        if let errorMessage {
+                            self.processingDisabledError = errorMessage
+                            input.completion(nil, input.buffer, errorMessage, nil)
+                        } else if let result {
+                            input.completion(result.pixelBuffer, input.buffer, nil, frameDuration)
+                        } else {
+                            input.completion(nil, input.buffer,
+                                             "Apple 4K 代理插帧没有生成输出帧", nil)
+                        }
+                        self.finishCurrentAndContinue()
                     }
-                    self.finishCurrentAndContinue()
                 }
+            } catch {
+                let errorMessage = "Apple 4K 代理插帧失败：\(String(describing: error))"
+                processingDisabledError = errorMessage
+                input.completion(nil, input.buffer, errorMessage, nil)
+                finishCurrentAndContinue()
             }
             return
         }
@@ -906,20 +910,19 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         cadenceMilliseconds: input.cadenceMilliseconds,
                         queueMilliseconds: queueMilliseconds,
                         preprocessingMilliseconds: result?.preprocessingMilliseconds ?? 0,
-                        resizeEncodeCPUMilliseconds: 0,
-                        resizeCommitToGPUStartMilliseconds: 0,
-                        resizeGPUExecutionMilliseconds: 0,
-                        resizeCommitToCompleteMilliseconds: 0,
-                        resizeWallMilliseconds: 0,
+                        commandBufferQueueWaitMilliseconds: 0,
+                        commandBufferGPUExecutionMilliseconds: 0,
+                        commandBufferCommitToCompleteMilliseconds: 0,
                         interpolationSubmitToReadyMilliseconds: 0,
                         opticalFlowMilliseconds: result?.opticalFlowMilliseconds ?? 0,
                         synthesisMilliseconds: result?.synthesisMilliseconds ?? 0,
                         providerMilliseconds: providerMilliseconds,
-                        appleFrameProcessingMilliseconds: 0,
+                        appleOrCombinedProcessingMilliseconds: 0,
                         captureToReadyMilliseconds: (ProcessInfo.processInfo.systemUptime
                                                      - input.submittedAtUptime) * 1_000,
                         proxyCacheHits: 0,
-                        proxyCacheMisses: 0))
+                        proxyCacheMisses: 0,
+                        usedSplitFallback: false))
                     if let errorMessage {
                         self.processingDisabledError = errorMessage
                         input.completion(nil, input.buffer, errorMessage, nil)
@@ -984,20 +987,19 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                     cadenceMilliseconds: input.cadenceMilliseconds,
                     queueMilliseconds: queueMilliseconds,
                     preprocessingMilliseconds: 0,
-                    resizeEncodeCPUMilliseconds: 0,
-                    resizeCommitToGPUStartMilliseconds: 0,
-                    resizeGPUExecutionMilliseconds: 0,
-                    resizeCommitToCompleteMilliseconds: 0,
-                    resizeWallMilliseconds: 0,
+                    commandBufferQueueWaitMilliseconds: 0,
+                    commandBufferGPUExecutionMilliseconds: 0,
+                    commandBufferCommitToCompleteMilliseconds: 0,
                     interpolationSubmitToReadyMilliseconds: providerMilliseconds,
                     opticalFlowMilliseconds: 0,
                     synthesisMilliseconds: 0,
                     providerMilliseconds: providerMilliseconds,
-                    appleFrameProcessingMilliseconds: providerMilliseconds,
+                    appleOrCombinedProcessingMilliseconds: providerMilliseconds,
                     captureToReadyMilliseconds: (ProcessInfo.processInfo.systemUptime
                                                  - input.submittedAtUptime) * 1_000,
                     proxyCacheHits: 0,
-                    proxyCacheMisses: 0))
+                    proxyCacheMisses: 0,
+                    usedSplitFallback: false))
                 let halfInterval = CMTimeGetSeconds(interval) / 2
                 let frameDuration = halfInterval.isFinite && halfInterval > 0 && halfInterval < 0.5
                     ? halfInterval : nil
@@ -1068,7 +1070,8 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             }
             let proxyCacheHits = values.reduce(0) { $0 + $1.proxyCacheHits }
             let proxyCacheMisses = values.reduce(0) { $0 + $1.proxyCacheMisses }
-            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); resizeEncodeCPU=\(range(\.resizeEncodeCPUMilliseconds)); resizeQueueWait=\(range(\.resizeCommitToGPUStartMilliseconds)); resizeGPU=\(range(\.resizeGPUExecutionMilliseconds)); resizeCommitToComplete=\(range(\.resizeCommitToCompleteMilliseconds)); resizeWall=\(range(\.resizeWallMilliseconds)); proxyCache=\(proxyCacheHits)/\(proxyCacheMisses); interpolationSubmitToReady=\(range(\.interpolationSubmitToReadyMilliseconds)); apple=\(range(\.appleFrameProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
+            let splitFallbacks = values.filter(\.usedSplitFallback).count
+            onTimingReport("插帧耗时 P50/P95 ms; backend=\(backend); samples=\(values.count); gameFPS=\(detectedGameFPS); gameInterval=\(range(\.gameFrameIntervalMilliseconds)); cadence=\(range(\.cadenceMilliseconds)); queue=\(range(\.queueMilliseconds)); proxyEncodeCPU=\(range(\.preprocessingMilliseconds)); commandBufferQueueWait=\(range(\.commandBufferQueueWaitMilliseconds)); commandBufferGPU=\(range(\.commandBufferGPUExecutionMilliseconds)); commandBufferCommitToComplete=\(range(\.commandBufferCommitToCompleteMilliseconds)); proxyCache=\(proxyCacheHits)/\(proxyCacheMisses); splitFallback=\(splitFallbacks); interpolationSubmitToReady=\(range(\.interpolationSubmitToReadyMilliseconds)); appleOrCombined=\(range(\.appleOrCombinedProcessingMilliseconds)); flow=\(range(\.opticalFlowMilliseconds)); synth=\(range(\.synthesisMilliseconds)); provider=\(range(\.providerMilliseconds)); captureToReady=\(range(\.captureToReadyMilliseconds))")
         }
         timingSamples.removeAll(keepingCapacity: true)
     }

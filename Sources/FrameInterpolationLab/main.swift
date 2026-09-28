@@ -536,26 +536,58 @@ private func runAppleDownsampleProbe(clipPath: String, previousFrameIndex: Int =
     let interpolator = try AppleDownsampledFrameInterpolator(
         width: CVPixelBufferGetWidth(current), height: CVPixelBufferGetHeight(current),
         pixelFormat: CVPixelBufferGetPixelFormatType(current))
-    let warmup = try interpolator.interpolate(previous: previous, current: current,
-                                              previousPresentationTimeStamp: previousTime,
-                                              currentPresentationTimeStamp: currentTime)
+    func interpolateSynchronously(previous: CVPixelBuffer, current: CVPixelBuffer,
+                                  previousTime: CMTime, currentTime: CMTime) throws
+        -> AppleDownsampledFrameInterpolator.Result {
+        let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var output: AppleDownsampledFrameInterpolator.Result?
+        var processingError: Error?
+        try interpolator.submit(previous: previous, current: current,
+                                previousPresentationTimeStamp: previousTime,
+                                currentPresentationTimeStamp: currentTime) { result, error in
+            lock.lock()
+            output = result
+            processingError = error
+            lock.unlock()
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + 5) == .success else {
+            throw NSError(domain: "FrameInterpolationLab", code: 51,
+                          userInfo: [NSLocalizedDescriptionKey: "Apple 代理插帧探针超时"])
+        }
+        lock.lock()
+        let result = output
+        let error = processingError
+        lock.unlock()
+        if let error { throw error }
+        guard let result else {
+            throw NSError(domain: "FrameInterpolationLab", code: 52,
+                          userInfo: [NSLocalizedDescriptionKey: "Apple 代理插帧没有生成结果"])
+        }
+        return result
+    }
+
+    let warmup = try interpolateSynchronously(previous: previous, current: current,
+                                              previousTime: previousTime, currentTime: currentTime)
     let interval = CMTimeSubtract(currentTime, previousTime)
     var measuredRuns: [AppleDownsampledFrameInterpolator.Result] = []
     for run in 0..<5 {
         let offset = Int32((run + 1) * 2)
-        measuredRuns.append(try interpolator.interpolate(
+        measuredRuns.append(try interpolateSynchronously(
             previous: previous, current: current,
-            previousPresentationTimeStamp: CMTimeAdd(previousTime, CMTimeMultiply(interval, multiplier: offset)),
-            currentPresentationTimeStamp: CMTimeAdd(currentTime, CMTimeMultiply(interval, multiplier: offset))))
+            previousTime: CMTimeAdd(previousTime, CMTimeMultiply(interval, multiplier: offset)),
+            currentTime: CMTimeAdd(currentTime, CMTimeMultiply(interval, multiplier: offset))))
     }
     let measured = measuredRuns[measuredRuns.count - 1]
     func median(_ values: [Double]) -> Double { values.sorted()[values.count / 2] }
-    print("Apple 全画面 1080p 代理插帧：源 3840×2160 → Metal NV12 盒式缩小 → Apple 插帧 → Catmull-Rom 放大回 4K")
-    print(String(format: "真实采集帧 %d→%d；首次 %.1f ms；后续 5 次中位数 %.1f ms（缩放 %.1f / Apple %.1f）；输出 %d×%d",
+    print("Apple 全画面 1080p 代理插帧：Metal NV12 缩小与 Apple 插帧串入同一 command buffer，渲染器直接缩放插帧输出")
+    print(String(format: "真实采集帧 %d→%d；首次 %.1f ms；后续 5 次中位数 %.1f ms（proxy 编码 CPU %.1f / command buffer GPU %.1f / commit 到完成 %.1f）；输出 %d×%d",
                  previousFrameIndex, currentFrameIndex, warmup.processingMilliseconds,
                  median(measuredRuns.map(\.processingMilliseconds)),
-                 median(measuredRuns.map(\.resizeMilliseconds)),
-                 median(measuredRuns.map(\.processorMilliseconds)),
+                 median(measuredRuns.map(\.proxyEncodeCPUMilliseconds)),
+                 median(measuredRuns.map(\.commandBufferGPUExecutionMilliseconds)),
+                 median(measuredRuns.map(\.commandBufferCommitToCompleteMilliseconds)),
                  measured.outputWidth, measured.outputHeight))
     func printColorRangeStats(_ label: String, _ buffer: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(buffer, .readOnly)

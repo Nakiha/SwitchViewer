@@ -1,26 +1,6 @@
 import CoreVideo
 import Foundation
 import Metal
-import QuartzCore
-
-struct NV12ResizeMetrics {
-    let encodeCPUMilliseconds: Double
-    let commitToGPUStartMilliseconds: Double
-    let gpuExecutionMilliseconds: Double
-    let commitToCompleteMilliseconds: Double
-
-    static let zero = NV12ResizeMetrics(encodeCPUMilliseconds: 0,
-                                        commitToGPUStartMilliseconds: 0,
-                                        gpuExecutionMilliseconds: 0,
-                                        commitToCompleteMilliseconds: 0)
-
-    static func + (lhs: Self, rhs: Self) -> Self {
-        Self(encodeCPUMilliseconds: lhs.encodeCPUMilliseconds + rhs.encodeCPUMilliseconds,
-             commitToGPUStartMilliseconds: lhs.commitToGPUStartMilliseconds + rhs.commitToGPUStartMilliseconds,
-             gpuExecutionMilliseconds: lhs.gpuExecutionMilliseconds + rhs.gpuExecutionMilliseconds,
-             commitToCompleteMilliseconds: lhs.commitToCompleteMilliseconds + rhs.commitToCompleteMilliseconds)
-    }
-}
 
 @available(macOS 26.0, *)
 final class NV12Scaler {
@@ -105,6 +85,13 @@ final class NV12Scaler {
         self.textureCache = cache
     }
 
+    func makeCommandBuffer() throws -> MTLCommandBuffer {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw ScalingError.commandBuffer
+        }
+        return commandBuffer
+    }
+
     /// Encodes NV12 scaling commands only. The caller owns command buffer submission.
     func encodeScale(source: CVPixelBuffer,
                      destination: CVPixelBuffer,
@@ -157,27 +144,4 @@ final class NV12Scaler {
         }
     }
 
-    /// Temporary synchronous adapter for the existing lab and realtime call sites.
-    func scaleSynchronously(_ source: CVPixelBuffer,
-                            into destination: CVPixelBuffer) throws -> NV12ResizeMetrics {
-        let encodeStart = CACurrentMediaTime()
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { throw ScalingError.commandBuffer }
-        try encodeScale(source: source, destination: destination, into: commandBuffer)
-        let commitTime = CACurrentMediaTime()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        let completedTime = CACurrentMediaTime()
-        if let error = commandBuffer.error {
-            throw ScalingError.commandExecution(error.localizedDescription)
-        }
-        let gpuStart = commandBuffer.gpuStartTime
-        let gpuEnd = commandBuffer.gpuEndTime
-        return NV12ResizeMetrics(
-            encodeCPUMilliseconds: max(0, commitTime - encodeStart) * 1_000,
-            commitToGPUStartMilliseconds: gpuStart > 0
-                ? max(0, gpuStart - commitTime) * 1_000 : 0,
-            gpuExecutionMilliseconds: gpuStart > 0 && gpuEnd >= gpuStart
-                ? (gpuEnd - gpuStart) * 1_000 : 0,
-            commitToCompleteMilliseconds: max(0, completedTime - commitTime) * 1_000)
-    }
 }
