@@ -209,3 +209,9 @@
 - 合并 command buffer 报错时，尝试 callback-driven fallback：独立异步缩放 command buffer 完成后，再调用 VideoToolbox 异步 completion-handler 接口。记录 fallback 次数。
 - `FrameInterpolationLab` 使用自身的同步探针包装器等待异步结果；这个等待仅在离线实验工具中，不进入 SwitchViewer 实时 4K 代理路径。
 - 合并路径的 `commandBufferGPU` 覆盖 resize 与 VT effect，不能解释成 resize-only GPU 时间。第一阶段的独立 resize 计时保留作改动前基线。Release 构建通过；尚未在实时采集卡场景运行，API 兼容性和 P50/P95/P99 变化待实机验证。
+
+## 2026-09-28：分离插帧回调的数据所有权
+
+- `FrameInterpolationCompletion` 不再把输入 source buffer 作为插帧结果返回。输入 source 由采集回调持有；插帧器只交付 midpoint、错误和帧间隔，避免调用方误把 source 生命周期/上屏决定交给插帧器。
+- 为保证这一阶段可运行，旧呈现策略暂由采集回调把自己持有的 source 传给原有配对适配器；上屏时机尚未改变，source 与 midpoint 的调度解耦留到下一阶段。
+- `swift build -c release` 通过；尚未运行实时 A/B。

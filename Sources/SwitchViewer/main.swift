@@ -395,7 +395,7 @@ final class RollingDiagnosticsLog {
     }
 }
 
-typealias FrameInterpolationCompletion = (CVPixelBuffer?, CVPixelBuffer, String?, TimeInterval?) -> Void
+typealias FrameInterpolationCompletion = (CVPixelBuffer?, String?, TimeInterval?) -> Void
 
 final class PresentationFrameTiming {
     enum Stage: Hashable {
@@ -726,7 +726,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             self.latestSubmission = nil
             self.submissionLock.unlock()
             for input in self.pending {
-                input.completion(nil, input.buffer, nil, nil)
+                input.completion(nil, nil, nil)
             }
             self.pending.removeAll(keepingCapacity: true)
             self.recentCaptureFrames.removeAll(keepingCapacity: true)
@@ -747,7 +747,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let queueMilliseconds = max(0, (processStartUptime - input.submittedAtUptime) * 1_000
                                     - input.cadenceMilliseconds)
         if processingDisabledError != nil {
-            input.completion(nil, input.buffer, nil, nil)
+            input.completion(nil, nil, nil)
             processNext()
             return
         }
@@ -755,13 +755,13 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             if input.repeatedGameFrame {
                 onRepeatedGameFrameSkipped()
             }
-            input.completion(nil, input.buffer, nil, nil)
+            input.completion(nil, nil, nil)
             processNext()
             return
         }
         guard let previousBuffer = input.previousBuffer,
               let previousPresentationTimeStamp = input.previousPresentationTimeStamp else {
-            input.completion(nil, input.buffer, nil, nil)
+            input.completion(nil, nil, nil)
             processNext()
             return
         }
@@ -777,7 +777,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                       height: CVPixelBufferGetHeight(input.buffer),
                                       pixelFormat: CVPixelBufferGetPixelFormatType(input.buffer)) {
             selectBackend("Apple 低延迟插帧不可用（需 1920×1080、受支持的 NV12 格式）")
-            input.completion(nil, input.buffer, nil, nil)
+            input.completion(nil, nil, nil)
             processNext()
             return
         }
@@ -786,7 +786,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                          height: CVPixelBufferGetHeight(input.buffer),
                                          pixelFormat: CVPixelBufferGetPixelFormatType(input.buffer)) {
             selectBackend("Apple 4K 代理插帧不可用（需 3840×2160 NV12）")
-            input.completion(nil, input.buffer, nil, nil)
+            input.completion(nil, nil, nil)
             processNext()
             return
         }
@@ -848,12 +848,11 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                             usedSplitFallback: result?.usedSplitFallback ?? false))
                         if let errorMessage {
                             self.processingDisabledError = errorMessage
-                            input.completion(nil, input.buffer, errorMessage, nil)
+                            input.completion(nil, errorMessage, nil)
                         } else if let result {
-                            input.completion(result.pixelBuffer, input.buffer, nil, frameDuration)
+                            input.completion(result.pixelBuffer, nil, frameDuration)
                         } else {
-                            input.completion(nil, input.buffer,
-                                             "Apple 4K 代理插帧没有生成输出帧", nil)
+                            input.completion(nil, "Apple 4K 代理插帧没有生成输出帧", nil)
                         }
                         self.finishCurrentAndContinue()
                     }
@@ -861,7 +860,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             } catch {
                 let errorMessage = "Apple 4K 代理插帧失败：\(String(describing: error))"
                 processingDisabledError = errorMessage
-                input.completion(nil, input.buffer, errorMessage, nil)
+                input.completion(nil, errorMessage, nil)
                 finishCurrentAndContinue()
             }
             return
@@ -925,12 +924,12 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         usedSplitFallback: false))
                     if let errorMessage {
                         self.processingDisabledError = errorMessage
-                        input.completion(nil, input.buffer, errorMessage, nil)
+                        input.completion(nil, errorMessage, nil)
                         self.endVideoToolboxSession()
                     } else if let result {
-                        input.completion(result.pixelBuffer, input.buffer, nil, frameDuration)
+                        input.completion(result.pixelBuffer, nil, frameDuration)
                     } else {
-                        input.completion(nil, input.buffer, "GPU 插帧没有生成输出帧", nil)
+                        input.completion(nil, "GPU 插帧没有生成输出帧", nil)
                     }
                     self.finishCurrentAndContinue()
                 }
@@ -947,7 +946,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                                        presentationTimeStamp: input.presentationTimeStamp),
               let previousFrame = VTFrameProcessorFrame(buffer: previousBuffer,
                                                         presentationTimeStamp: previousPresentationTimeStamp) else {
-            input.completion(nil, input.buffer, "创建插帧输入帧失败", nil)
+            input.completion(nil, "创建插帧输入帧失败", nil)
             processNext()
             return
         }
@@ -956,7 +955,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let poolStatus = outputPool.map { CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, $0, &outputBuffer) }
             ?? kCVReturnInvalidPixelBufferAttributes
         guard poolStatus == kCVReturnSuccess, let outputBuffer else {
-            input.completion(nil, input.buffer, "创建插帧输出缓冲失败 status=\(poolStatus)", nil)
+            input.completion(nil, "创建插帧输出缓冲失败 status=\(poolStatus)", nil)
             processNext()
             return
         }
@@ -969,7 +968,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                 previousFrame: previousFrame,
                 interpolationPhase: [0.5],
                 destinationFrames: [destination]) else {
-            input.completion(nil, input.buffer, "创建插帧参数失败", nil)
+            input.completion(nil, "创建插帧参数失败", nil)
             processNext()
             return
         }
@@ -1012,7 +1011,6 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                 }
                 if let processorError { self.processingDisabledError = processorError }
                 input.completion(error == nil ? outputBuffer : nil,
-                                 input.buffer,
                                  processorError,
                                  frameDuration)
                 if processorError != nil {
@@ -1034,7 +1032,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
 
     private func fail(_ input: Input, message: String) {
         processingDisabledError = message
-        input.completion(nil, input.buffer, message, nil)
+        input.completion(nil, message, nil)
         endVideoToolboxSession()
         processNext()
     }
@@ -2600,12 +2598,12 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         if interpolationEnabled, let interpolationEngine {
             interpolationEngine.submit(pb,
                                        presentationTimeStamp: presentationTimeStamp) {
-                [weak self] generated, source, error, halfInterval in
+                [weak self] generated, error, halfInterval in
                 guard let self else { return }
                 if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
                     self.recordInterpolationFailure(error)
                 }
-                self.enqueueInterpolatedFrames(generated: generated, source: source,
+                self.enqueueInterpolatedFrames(generated: generated, source: pb,
                                                sourcePresentationTimeStamp: presentationTimeStamp,
                                                sourceTimestampHostTime: presentationTimestampHostTime,
                                                captureCallbackHostTime: captureCallbackHostTime,
