@@ -5,11 +5,36 @@ import Metal
 import QuartzCore
 import VideoToolbox
 
-/// Runs Apple's temporal interpolator on a full-frame 1080p proxy.
-/// Proxy scaling completes before VideoToolbox receives the request; keeping
-/// these submissions separate avoids the crashing Metal command-buffer API path.
-/// The renderer scales the generated proxy to the display drawable directly;
-/// the original capture frames remain at their native resolution.
+/// Resolutions that `VTLowLatencyFrameInterpolationConfiguration` actually runs on.
+///
+/// The documented limit is `maximumDimensionForSpatialScaleFactor:` together with
+/// `maximumPixelCountForSpatialScaleFactor:` (1920 and 2073600 on M5). In practice
+/// the processor only accepts the resolutions its models were trained for: 576p,
+/// 720p and 1080p. Other in-range sizes that satisfy the documented limits still
+/// fail at process time with `VTFrameProcessorProcessingError` (-19740).
+public enum AppleLowLatencyProxySize {
+    public static let supported: [(width: Int, height: Int)] = [
+        (1920, 1080), (1280, 720), (1024, 576)
+    ]
+
+    /// Largest supported proxy that still fits inside the input frame.
+    public static func best(forWidth width: Int, height: Int) -> (width: Int, height: Int)? {
+        supported.first { $0.width <= width && $0.height <= height }
+    }
+
+    public static func supports(width: Int, height: Int) -> Bool {
+        best(forWidth: width, height: height) != nil
+    }
+}
+
+/// Runs Apple's temporal interpolator on a downsampled proxy of the input frames.
+/// The renderer scales the generated proxy to the display drawable directly, so
+/// source frames keep their native resolution while generated midpoints are softer.
+///
+/// When the input already matches a resolution Apple accepts, the frames go to
+/// VideoToolbox unchanged; otherwise a full-frame proxy is produced first. Proxy
+/// scaling completes before VideoToolbox receives the request; keeping these
+/// submissions separate avoids the crashing Metal command-buffer API path.
 @available(macOS 26.0, *)
 public final class AppleDownsampledFrameInterpolator {
     public struct Result {
@@ -25,10 +50,12 @@ public final class AppleDownsampledFrameInterpolator {
         public let proxyCacheHits: Int
         public let proxyCacheMisses: Int
         public let usedSeparateProcessorSubmission: Bool
+        public let usedProxyScaling: Bool
     }
 
-    public enum InterpolationError: Error, CustomStringConvertible {
+    public enum InterpolationError: Error, LocalizedError, CustomStringConvertible {
         case invalidDimensions
+        case unsupportedInputSize(Int, Int)
         case unsupportedConfiguration
         case unsupportedPixelFormat(OSType)
         case pixelBufferPool(OSStatus)
@@ -43,21 +70,23 @@ public final class AppleDownsampledFrameInterpolator {
         public var description: String {
             switch self {
             case .invalidDimensions:
-                return "输入必须是 3840×2160 NV12"
+                return "输入尺寸与插帧器配置不一致，或不是 NV12 缓冲"
+            case .unsupportedInputSize(let width, let height):
+                return "Apple 低延迟插帧不支持 \(width)×\(height)：需要至少 1024×576 的 NV12 输入"
             case .unsupportedConfiguration:
-                return "Apple VideoToolbox 无法创建 1920×1080 插帧配置"
+                return "Apple VideoToolbox 无法创建插帧配置"
             case .unsupportedPixelFormat(let format):
                 return "Apple VideoToolbox 不支持 NV12 输入：\(format)"
             case .pixelBufferPool(let status):
                 return "创建 Apple 插帧像素缓冲池失败：\(status)"
             case .invalidPresentationTimestamps:
-                return "Apple 4K 代理插帧要求有效且递增、间隔小于 1 秒的媒体时间戳"
+                return "Apple 代理插帧要求有效且递增、间隔小于 1 秒的媒体时间戳"
             case .frameCreation:
                 return "创建 Apple 插帧帧对象失败"
             case .parametersCreation:
                 return "创建 Apple 插帧参数失败"
             case .alreadyProcessing:
-                return "Apple 4K 代理插帧器已有正在处理的任务"
+                return "Apple 代理插帧器已有正在处理的任务"
             case .processor(let message):
                 return "Apple 低延迟插帧失败：\(message)"
             case .metalUnavailable:
@@ -66,12 +95,18 @@ public final class AppleDownsampledFrameInterpolator {
                 return "Metal NV12 缩放失败：\(message)"
             }
         }
+
+        /// `localizedDescription` 走的是 LocalizedError，不实现它日志里只会出现错误序号。
+        public var errorDescription: String? { description }
     }
 
     private let width: Int
     private let height: Int
-    private let proxyWidth = 1920
-    private let proxyHeight = 1080
+    private let proxyWidth: Int
+    private let proxyHeight: Int
+    /// False when the input already matches a resolution Apple accepts, in which
+    /// case the captured buffers are submitted to VideoToolbox unchanged.
+    private let scalesProxy: Bool
     private let processor = VTFrameProcessor()
     private let proxyInputPool: CVPixelBufferPool
     private let proxyOutputPool: CVPixelBufferPool
@@ -142,15 +177,17 @@ public final class AppleDownsampledFrameInterpolator {
         }
     }
 
-    public init(width: Int = 3840, height: Int = 2160,
+    public var proxySize: (width: Int, height: Int) { (proxyWidth, proxyHeight) }
+    public var usesProxyScaling: Bool { scalesProxy }
+
+    public init(width: Int, height: Int,
                 pixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) throws {
-        guard width == 3840, height == 2160,
-              width.isMultiple(of: proxyWidth), height.isMultiple(of: proxyHeight) else {
-            throw InterpolationError.invalidDimensions
+        guard let proxy = AppleLowLatencyProxySize.best(forWidth: width, height: height) else {
+            throw InterpolationError.unsupportedInputSize(width, height)
         }
         guard VTLowLatencyFrameInterpolationConfiguration.isSupported,
               let configuration = VTLowLatencyFrameInterpolationConfiguration(
-                frameWidth: proxyWidth, frameHeight: proxyHeight,
+                frameWidth: proxy.width, frameHeight: proxy.height,
                 numberOfInterpolatedFrames: 1) else {
             throw InterpolationError.unsupportedConfiguration
         }
@@ -162,6 +199,9 @@ public final class AppleDownsampledFrameInterpolator {
         }
         self.width = width
         self.height = height
+        self.proxyWidth = proxy.width
+        self.proxyHeight = proxy.height
+        self.scalesProxy = proxy.width != width || proxy.height != height
         do {
             self.scaler = try NV12Scaler(device: device)
         } catch {
@@ -181,7 +221,7 @@ public final class AppleDownsampledFrameInterpolator {
     }
 
     deinit {
-        if sessionStarted { processor.endSession() }
+        if sessionStarted { FrameProcessorSessionCleanup.end([processor]) }
     }
 
     public func submit(previous: CVPixelBuffer, current: CVPixelBuffer,
@@ -218,15 +258,33 @@ public final class AppleDownsampledFrameInterpolator {
                 ? currentPresentationTimeStamp : nil
 
             let startedUptime = ProcessInfo.processInfo.systemUptime
-            let encodeStart = ProcessInfo.processInfo.systemUptime
-            let commandBuffer = try scaler.makeCommandBuffer()
-            let previousProxy = try proxyPixelBuffer(
-                from: previous, presentationTimeStamp: previousPresentationTimeStamp,
-                into: commandBuffer)
-            let currentProxy = try proxyPixelBuffer(
-                from: current, presentationTimeStamp: currentPresentationTimeStamp,
-                into: commandBuffer)
-            let proxyEncodeCPUMilliseconds = (ProcessInfo.processInfo.systemUptime - encodeStart) * 1_000
+            let previousProxy: ProxyResult
+            let currentProxy: ProxyResult
+            let proxyEncodeCPUMilliseconds: Double
+            let proxyCommandBuffer: MTLCommandBuffer?
+
+            if scalesProxy {
+                let encodeStart = ProcessInfo.processInfo.systemUptime
+                let commandBuffer = try scaler.makeCommandBuffer()
+                previousProxy = try proxyPixelBuffer(
+                    from: previous, presentationTimeStamp: previousPresentationTimeStamp,
+                    into: commandBuffer)
+                currentProxy = try proxyPixelBuffer(
+                    from: current, presentationTimeStamp: currentPresentationTimeStamp,
+                    into: commandBuffer)
+                proxyEncodeCPUMilliseconds = (ProcessInfo.processInfo.systemUptime - encodeStart) * 1_000
+                proxyCommandBuffer = commandBuffer
+            } else {
+                // The capture already matches a resolution Apple accepts; submit it as-is.
+                previousProxy = ProxyResult(pixelBuffer: previous, wasCached: false,
+                                            cacheOnCompletion: false,
+                                            presentationTimeStamp: previousPresentationTimeStamp)
+                currentProxy = ProxyResult(pixelBuffer: current, wasCached: false,
+                                           cacheOnCompletion: false,
+                                           presentationTimeStamp: currentPresentationTimeStamp)
+                proxyEncodeCPUMilliseconds = 0
+                proxyCommandBuffer = nil
+            }
 
             let midpoint = CMTimeAdd(previousPresentationTimeStamp,
                 CMTimeMultiplyByFloat64(CMTimeSubtract(currentPresentationTimeStamp,
@@ -258,55 +316,72 @@ public final class AppleDownsampledFrameInterpolator {
                 destinationFrame: destination, parameters: parameters,
                 proxyEncodeCPUMilliseconds: proxyEncodeCPUMilliseconds,
                 completion: completion)
-            let commitTime = CACurrentMediaTime()
-            commandBuffer.addCompletedHandler { [self, job] completedBuffer in
-                if let resizeError = completedBuffer.error {
-                    self.finish(job, result: nil,
-                                error: InterpolationError.metalProcessing(
-                                    "4K 代理缩放 command buffer 失败：\(resizeError.localizedDescription)"))
-                    return
-                }
 
-                self.cacheProxyIfNeeded(job.previousProxy)
-                self.cacheProxyIfNeeded(job.currentProxy)
-                let scaleCommandBufferCompletedAt = CACurrentMediaTime()
-                self.processor.process(parameters: job.parameters) { [self, job] _, processorError in
-                    if let processorError {
+            if let commandBuffer = proxyCommandBuffer {
+                let commitTime = CACurrentMediaTime()
+                commandBuffer.addCompletedHandler { [self, job] completedBuffer in
+                    if let resizeError = completedBuffer.error {
                         self.finish(job, result: nil,
-                                    error: InterpolationError.processor(
-                                        "分离式 VideoToolbox 插帧失败：\(processorError.localizedDescription)"))
+                                    error: InterpolationError.metalProcessing(
+                                        "代理缩放 command buffer 失败：\(resizeError.localizedDescription)"))
                         return
                     }
-
-                    CVBufferPropagateAttachments(job.currentSource, job.output)
-                    let callbackTime = ProcessInfo.processInfo.systemUptime
-                    let gpuStart = completedBuffer.gpuStartTime
-                    let gpuEnd = completedBuffer.gpuEndTime
-                    let result = Result(
-                        pixelBuffer: job.output,
-                        processingMilliseconds: (callbackTime - job.startedUptime) * 1_000,
-                        proxyEncodeCPUMilliseconds: job.proxyEncodeCPUMilliseconds,
-                        commandBufferCommitToGPUStartMilliseconds: gpuStart > 0
-                            ? max(0, gpuStart - commitTime) * 1_000 : 0,
-                        commandBufferGPUExecutionMilliseconds: gpuStart > 0 && gpuEnd >= gpuStart
-                            ? (gpuEnd - gpuStart) * 1_000 : 0,
-                        commandBufferCommitToCompleteMilliseconds:
-                            max(0, scaleCommandBufferCompletedAt - commitTime) * 1_000,
-                        interpolationSubmitToReadyMilliseconds: (callbackTime - job.startedUptime) * 1_000,
-                        outputWidth: CVPixelBufferGetWidth(job.output),
-                        outputHeight: CVPixelBufferGetHeight(job.output),
-                        proxyCacheHits: (job.previousProxy.wasCached ? 1 : 0)
-                            + (job.currentProxy.wasCached ? 1 : 0),
-                        proxyCacheMisses: (job.previousProxy.wasCached ? 0 : 1)
-                            + (job.currentProxy.wasCached ? 0 : 1),
-                        usedSeparateProcessorSubmission: true)
-                    self.finish(job, result: result, error: nil)
+                    self.cacheProxyIfNeeded(job.previousProxy)
+                    self.cacheProxyIfNeeded(job.currentProxy)
+                    self.runProcessor(job,
+                                      commitTime: commitTime,
+                                      commandBufferCompletedAt: CACurrentMediaTime(),
+                                      gpuStart: completedBuffer.gpuStartTime,
+                                      gpuEnd: completedBuffer.gpuEndTime)
                 }
+                commandBuffer.commit()
+            } else {
+                let submitTime = CACurrentMediaTime()
+                runProcessor(job, commitTime: submitTime,
+                             commandBufferCompletedAt: submitTime,
+                             gpuStart: 0, gpuEnd: 0)
             }
-            commandBuffer.commit()
         } catch {
             releaseJob(jobID)
             throw error
+        }
+    }
+
+    private func runProcessor(_ job: AppleInterpolationJob,
+                              commitTime: CFTimeInterval,
+                              commandBufferCompletedAt: CFTimeInterval,
+                              gpuStart: CFTimeInterval,
+                              gpuEnd: CFTimeInterval) {
+        processor.process(parameters: job.parameters) { [self, job] _, processorError in
+            if let processorError {
+                self.finish(job, result: nil,
+                            error: InterpolationError.processor(
+                                "VideoToolbox 插帧失败：\(processorError.localizedDescription)"))
+                return
+            }
+
+            CVBufferPropagateAttachments(job.currentSource, job.output)
+            let callbackTime = ProcessInfo.processInfo.systemUptime
+            let result = Result(
+                pixelBuffer: job.output,
+                processingMilliseconds: (callbackTime - job.startedUptime) * 1_000,
+                proxyEncodeCPUMilliseconds: job.proxyEncodeCPUMilliseconds,
+                commandBufferCommitToGPUStartMilliseconds: gpuStart > 0
+                    ? max(0, gpuStart - commitTime) * 1_000 : 0,
+                commandBufferGPUExecutionMilliseconds: gpuStart > 0 && gpuEnd >= gpuStart
+                    ? (gpuEnd - gpuStart) * 1_000 : 0,
+                commandBufferCommitToCompleteMilliseconds:
+                    max(0, commandBufferCompletedAt - commitTime) * 1_000,
+                interpolationSubmitToReadyMilliseconds: (callbackTime - job.startedUptime) * 1_000,
+                outputWidth: CVPixelBufferGetWidth(job.output),
+                outputHeight: CVPixelBufferGetHeight(job.output),
+                proxyCacheHits: (job.previousProxy.wasCached ? 1 : 0)
+                    + (job.currentProxy.wasCached ? 1 : 0),
+                proxyCacheMisses: (job.previousProxy.wasCached ? 0 : 1)
+                    + (job.currentProxy.wasCached ? 0 : 1),
+                usedSeparateProcessorSubmission: true,
+                usedProxyScaling: scalesProxy)
+            self.finish(job, result: result, error: nil)
         }
     }
 

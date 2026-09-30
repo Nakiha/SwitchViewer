@@ -42,6 +42,7 @@ final class PreviewView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         metalLayer.framebufferOnly = true
         metalLayer.maximumDrawableCount = maximumPresentationInFlightFrames
         metalLayer.contentsScale = 2.0
@@ -82,6 +83,7 @@ enum ColorMode: Int, CaseIterable {
 
 final class MetalRenderer {
     let device: MTLDevice
+    private var sourceProxyScaler: AnyObject?
     let queue: MTLCommandQueue
     let pipeline: MTLRenderPipelineState
     var cache: CVMetalTextureCache?
@@ -231,14 +233,23 @@ final class MetalRenderer {
     }
 
     /// 核心编码：画到指定纹理；present 非空时一并呈现。nil=成功，否则为原因
-    func encode(pixelBuffer pb: CVPixelBuffer, to target: MTLTexture,
+    func encode(pixelBuffer sourcePB: CVPixelBuffer, to target: MTLTexture,
                 scale: SIMD2<Float>, present drawable: MTLDrawable?,
                 minimumPresentationDuration: TimeInterval? = nil,
                 targetPresentationHostTime: CFTimeInterval? = nil,
                 onPresented: ((CFTimeInterval) -> Void)? = nil,
                 onCommandBufferCommitted: (() -> Void)? = nil,
-                onGPUCompleted: (() -> Void)? = nil) -> String? {
+                onGPUCompleted: (() -> Void)? = nil,
+                softenSource: Bool = false) -> String? {
         guard let cache = cache else { return "无纹理缓存" }
+        guard let buf = queue.makeCommandBuffer() else { return "建命令缓冲失败" }
+        let pb: CVPixelBuffer
+        if softenSource, #available(macOS 26.0, *) {
+            do {
+                if sourceProxyScaler == nil { sourceProxyScaler = try SourceFrameProxyScaler(device: device) }
+                pb = try (sourceProxyScaler as! SourceFrameProxyScaler).encode(source: sourcePB, into: buf)
+            } catch { return "原始帧代理缩放失败：\(error)" }
+        } else { pb = sourcePB }
         let w = CVPixelBufferGetWidth(pb)
         let h = CVPixelBufferGetHeight(pb)
         var yRef: CVMetalTexture?
@@ -252,7 +263,6 @@ final class MetalRenderer {
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1)
         pass.colorAttachments[0].storeAction = .store
-        guard let buf = queue.makeCommandBuffer() else { return "建命令缓冲失败" }
         guard let enc = buf.makeRenderCommandEncoder(descriptor: pass) else { return "建编码器失败" }
         var s = scale
         var (m, o) = uniforms(for: pb)
@@ -264,6 +274,7 @@ final class MetalRenderer {
         enc.setFragmentBytes(&o, length: MemoryLayout<SIMD4<Float>>.size, index: 1)
         enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
         enc.endEncoding()
+        buf.addCompletedHandler { _ in withExtendedLifetime((pb, yRef, cRef)) {} }
         if let onGPUCompleted {
             buf.addCompletedHandler { _ in onGPUCompleted() }
         }
@@ -288,6 +299,8 @@ final class MetalRenderer {
 
     /// 成功返回 (true, nil)；失败返回 (false, 原因)
     func render(pixelBuffer pb: CVPixelBuffer,
+                referenceAspect: Float? = nil,
+                softenSource: Bool = false,
                 minimumPresentationDuration: TimeInterval? = nil,
                 targetPresentationHostTime: CFTimeInterval? = nil,
                 onPresented: ((CFTimeInterval) -> Void)? = nil,
@@ -308,9 +321,9 @@ final class MetalRenderer {
         onDrawableAcquired?()
         let w = CVPixelBufferGetWidth(pb)
         let h = CVPixelBufferGetHeight(pb)
-        // 等比适配
+        // 等比适配。插值帧传入所属源帧的宽高比，保证与源帧显示比例一致。
         let viewAspect = Float(ds.width / max(1, ds.height))
-        let videoAspect = Float(w) / Float(max(1, h))
+        let videoAspect = referenceAspect ?? (Float(w) / Float(max(1, h)))
         let scale: SIMD2<Float>
         if videoAspect >= viewAspect {
             scale = SIMD2<Float>(1, viewAspect / videoAspect)
@@ -323,7 +336,8 @@ final class MetalRenderer {
                             targetPresentationHostTime: targetPresentationHostTime,
                             onPresented: onPresented,
                             onCommandBufferCommitted: onCommandBufferCommitted,
-                            onGPUCompleted: onGPUCompleted) {
+                            onGPUCompleted: onGPUCompleted,
+                            softenSource: softenSource) {
             return (false, err)
         }
         return (true, nil)
@@ -341,9 +355,15 @@ final class RollingDiagnosticsLog {
     private let archiveCount = 5
 
     init() {
-        let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library", isDirectory: true)
-        directoryURL = library.appendingPathComponent("Logs/SwitchViewer", isDirectory: true)
+        // SWITCHVIEWER_LOG_DIR 覆盖日志目录；沙箱内运行或想把日志放到别处时用。
+        if let override = ProcessInfo.processInfo.environment["SWITCHVIEWER_LOG_DIR"],
+           !override.isEmpty {
+            directoryURL = URL(fileURLWithPath: override, isDirectory: true)
+        } else {
+            let library = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
+                ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library", isDirectory: true)
+            directoryURL = library.appendingPathComponent("Logs/SwitchViewer", isDirectory: true)
+        }
         fileURL = directoryURL.appendingPathComponent("switchviewer.log")
     }
 
@@ -510,6 +530,11 @@ struct PresentationFrame {
     let targetPresentationHostTime: CFTimeInterval?
     let sourceID: UInt64?
     let sourceContentRootID: UInt64?
+    /// 该帧应该按什么宽高比显示。插值帧是源帧的非等比缩放代理（例如
+    /// 3024×1898 → 1920×1080），如果按它自己的宽高比做等比适配，插值帧和源帧
+    /// 的显示比例就不一致，看起来会来回闪。插值帧必须沿用其源帧的宽高比。
+    /// nil = 用缓冲自身的宽高比。
+    let referenceAspect: Float?
     let timing: PresentationFrameTiming
 
     init(pixelBuffer: CVPixelBuffer, displaySignature: DisplayFrameSignature? = nil,
@@ -519,6 +544,7 @@ struct PresentationFrame {
          targetPresentationHostTime: CFTimeInterval? = nil,
          sourceID: UInt64? = nil,
          sourceContentRootID: UInt64? = nil,
+         referenceAspect: Float? = nil,
          timing: PresentationFrameTiming) {
         self.pixelBuffer = pixelBuffer
         self.displaySignature = displaySignature
@@ -528,6 +554,7 @@ struct PresentationFrame {
         self.targetPresentationHostTime = targetPresentationHostTime
         self.sourceID = sourceID
         self.sourceContentRootID = sourceContentRootID
+        self.referenceAspect = referenceAspect
         self.timing = timing
     }
 }
@@ -535,6 +562,7 @@ struct PresentationFrame {
 protocol FrameInterpolationEngine: AnyObject {
     func submit(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime,
                 displaySignature: DisplayFrameSignature?,
+                contentTimed: Bool,
                 completion: @escaping FrameInterpolationCompletion)
     func setMode(_ mode: FrameInterpolationMode)
     func reset()
@@ -557,10 +585,10 @@ private func canUseAppleLowLatencyFrame(width: Int, height: Int, pixelFormat: OS
         && AppleLowLatencyFrameSupport.supportedPixelFormats.contains(pixelFormat)
 }
 
-private func canUseAppleLowLatency4KProxy(width: Int, height: Int, pixelFormat: OSType) -> Bool {
-    width == 3840 && height == 2160
-        && pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+private func canUseAppleProxy(width: Int, height: Int, pixelFormat: OSType) -> Bool {
+    pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         && AppleLowLatencyFrameSupport.supportedPixelFormats.contains(pixelFormat)
+        && AppleLowLatencyProxySize.supports(width: width, height: height)
 }
 
 @available(macOS 26.0, *)
@@ -569,6 +597,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let buffer: CVPixelBuffer
         let presentationTimeStamp: CMTime
         let displaySignature: DisplayFrameSignature?
+        let contentTimed: Bool
         let completion: FrameInterpolationCompletion
         let submittedAtUptime: TimeInterval
     }
@@ -617,6 +646,9 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
     private let submissionLock = NSLock()
     private var processor = VTFrameProcessor()
     private let cadenceDetector = SwitchFrameCadenceDetector()
+    private let contentCadenceDetector = ContentFrameCadenceDetector()
+    private var lastContentFrame: CapturedFrame?
+    private var lastContentRateReport = 0.0
     private let onRepeatedGameFrameSkipped: () -> Void
     private let onCadenceChanged: (Double?) -> Void
     private let onQueuedFramesDropped: (Int) -> Void
@@ -659,10 +691,12 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
 
     func submit(_ pixelBuffer: CVPixelBuffer, presentationTimeStamp: CMTime,
                 displaySignature: DisplayFrameSignature?,
+                contentTimed: Bool,
                 completion: @escaping FrameInterpolationCompletion) {
         let submission = Submission(buffer: pixelBuffer,
                                     presentationTimeStamp: presentationTimeStamp,
                                     displaySignature: displaySignature,
+                                    contentTimed: contentTimed,
                                     completion: completion,
                                     submittedAtUptime: ProcessInfo.processInfo.systemUptime)
         submissionLock.lock()
@@ -688,6 +722,11 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         latestSubmission = nil
         submissionLock.unlock()
 
+        if submission.contentTimed {
+            drainContentSubmission(submission)
+            scheduleNextSubmission()
+            return
+        }
         let cadenceStart = ProcessInfo.processInfo.systemUptime
         let seconds = CMTimeGetSeconds(submission.presentationTimeStamp)
         let cadence: SwitchFrameCadenceDetector.Result?
@@ -732,6 +771,10 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                              detectedGameFPS: cadence?.gameFPS))
         processNext()
 
+        scheduleNextSubmission()
+    }
+
+    private func scheduleNextSubmission() {
         submissionLock.lock()
         let hasMoreSubmissions = latestSubmission != nil
         if !hasMoreSubmissions { isSubmissionDrainScheduled = false }
@@ -739,6 +782,39 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         if hasMoreSubmissions {
             queue.async { self.drainLatestSubmission() }
         }
+    }
+
+    private func drainContentSubmission(_ submission: Submission) {
+        let start = ProcessInfo.processInfo.systemUptime
+        let result = contentCadenceDetector.observe(signature: submission.displaySignature,
+                                                    time: CMTimeGetSeconds(submission.presentationTimeStamp))
+        if result.isDuplicate {
+            onRepeatedGameFrameSkipped()
+            submission.completion(nil, nil, nil)
+            return
+        }
+        let previous = lastContentFrame
+        lastContentFrame = CapturedFrame(buffer: submission.buffer,
+                                        presentationTimeStamp: submission.presentationTimeStamp)
+        if start - lastContentRateReport >= 1 {
+            lastContentRateReport = start
+            onCadenceChanged(result.observedFPS)
+        }
+        if pending.count >= 2 {
+            onQueuedFramesDropped(pending.count)
+            pending.removeAll(keepingCapacity: true)
+        }
+        pending.append(Input(buffer: submission.buffer,
+                             presentationTimeStamp: submission.presentationTimeStamp,
+                             completion: submission.completion,
+                             previousBuffer: previous?.buffer,
+                             previousPresentationTimeStamp: previous?.presentationTimeStamp,
+                             shouldInterpolate: result.shouldInterpolate,
+                             repeatedGameFrame: false,
+                             cadenceMilliseconds: (ProcessInfo.processInfo.systemUptime - start) * 1_000,
+                             submittedAtUptime: submission.submittedAtUptime,
+                             detectedGameFPS: result.observedFPS))
+        processNext()
     }
 
     func reset() {
@@ -751,6 +827,9 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             self.timingSamples.removeAll(keepingCapacity: true)
             self.lastTimingReportUptime = ProcessInfo.processInfo.systemUptime
             self.cadenceDetector.reset()
+            self.contentCadenceDetector.reset()
+            self.lastContentFrame = nil
+            self.lastContentRateReport = 0
             self.onCadenceChanged(nil)
             self.appleProxyInterpolator = nil
             if self.isProcessing {
@@ -776,6 +855,9 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             self.timingSamples.removeAll(keepingCapacity: true)
             self.lastTimingReportUptime = ProcessInfo.processInfo.systemUptime
             self.cadenceDetector.reset()
+            self.contentCadenceDetector.reset()
+            self.lastContentFrame = nil
+            self.lastContentRateReport = 0
             self.onCadenceChanged(nil)
             self.activeBackend = nil
             self.appleProxyInterpolator = nil
@@ -835,17 +917,19 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             processNext()
             return
         }
-        if selectedMode == .appleLowLatency4KProxy,
-           !canUseAppleLowLatency4KProxy(width: CVPixelBufferGetWidth(input.buffer),
+        if selectedMode == .appleProxy,
+           !canUseAppleProxy(width: CVPixelBufferGetWidth(input.buffer),
                                          height: CVPixelBufferGetHeight(input.buffer),
                                          pixelFormat: CVPixelBufferGetPixelFormatType(input.buffer)) {
-            selectBackend("Apple 4K 代理插帧不可用（需 3840×2160 NV12）")
+            selectBackend("Apple 代理插帧不可用（需至少 1024×576 的 NV12）")
             input.completion(nil, nil, nil)
             processNext()
             return
         }
-        if selectedMode == .appleLowLatency4KProxy {
-            let backendLabel = "Apple 低延迟插帧（4K输入→1080p代理，4K窗口显示）"
+        if selectedMode == .appleProxy {
+            let backendLabel = Self.appleProxyBackendLabel(
+                inputWidth: CVPixelBufferGetWidth(input.buffer),
+                inputHeight: CVPixelBufferGetHeight(input.buffer))
             selectBackend(backendLabel)
             endVideoToolboxSession()
             let interpolator: AppleDownsampledFrameInterpolator
@@ -859,9 +943,13 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         pixelFormat: CVPixelBufferGetPixelFormatType(input.buffer))
                     appleProxyInterpolator = created
                     interpolator = created
+                    // 只在新建插帧器时报一次几何关系，避免每帧刷日志。
+                    onTimingReport(Self.appleProxyGeometryReport(
+                        inputWidth: CVPixelBufferGetWidth(input.buffer),
+                        inputHeight: CVPixelBufferGetHeight(input.buffer)))
                 }
             } catch {
-                fail(input, message: "初始化 Apple 4K 代理插帧失败：\(error.localizedDescription)")
+                fail(input, message: "初始化 Apple 代理插帧失败：\(error.localizedDescription)")
                 return
             }
             isProcessing = true
@@ -874,7 +962,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                     let providerMilliseconds = result?.processingMilliseconds
                         ?? (ProcessInfo.processInfo.systemUptime - providerStartUptime) * 1_000
                     self.queue.async {
-                        let errorMessage = error.map { "Apple 4K 代理插帧失败：\(String(describing: $0))" }
+                        let errorMessage = error.map { "Apple 代理插帧失败：\(String(describing: $0))" }
                         self.recordTiming(TimingSample(
                             backend: backendLabel,
                             detectedGameFPS: input.detectedGameFPS,
@@ -907,13 +995,13 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                         } else if let result {
                             input.completion(result.pixelBuffer, nil, frameDuration)
                         } else {
-                            input.completion(nil, "Apple 4K 代理插帧没有生成输出帧", nil)
+                            input.completion(nil, "Apple 代理插帧没有生成输出帧", nil)
                         }
                         self.finishCurrentAndContinue()
                     }
                 }
             } catch {
-                let errorMessage = "Apple 4K 代理插帧失败：\(String(describing: error))"
+                let errorMessage = "Apple 代理插帧失败：\(String(describing: error))"
                 processingDisabledError = errorMessage
                 input.completion(nil, errorMessage, nil)
                 finishCurrentAndContinue()
@@ -1129,8 +1217,31 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         timingSamples.removeAll(keepingCapacity: true)
     }
 
+    static func appleProxyBackendLabel(inputWidth: Int, inputHeight: Int) -> String {
+        guard let proxy = AppleLowLatencyProxySize.best(forWidth: inputWidth, height: inputHeight) else {
+            return "Apple 低延迟插帧（代理）"
+        }
+        if proxy.width == inputWidth, proxy.height == inputHeight {
+            return "Apple 低延迟插帧（\(inputWidth)×\(inputHeight) 原生）"
+        }
+        return "Apple 低延迟插帧（\(inputWidth)×\(inputHeight)→\(proxy.width)×\(proxy.height)代理）"
+    }
+
+    /// 记录代理与源帧的几何关系。代理是非等比缩放，显示时按源帧宽高比适配；
+    /// 这条日志用来核实两者确实一致（比例闪烁问题的现场证据）。
+    static func appleProxyGeometryReport(inputWidth: Int, inputHeight: Int) -> String {
+        let sourceAspect = Double(inputWidth) / Double(max(1, inputHeight))
+        guard let proxy = AppleLowLatencyProxySize.best(forWidth: inputWidth, height: inputHeight) else {
+            return String(format: "代理几何; source=%d×%d aspect=%.4f; proxy=无", inputWidth, inputHeight, sourceAspect)
+        }
+        let proxyAspect = Double(proxy.width) / Double(proxy.height)
+        return String(format: "代理几何; source=%d×%d aspect=%.4f; proxy=%d×%d aspect=%.4f; 插值帧按源宽高比显示",
+                      inputWidth, inputHeight, sourceAspect,
+                      proxy.width, proxy.height, proxyAspect)
+    }
+
     private func requiresGPU(for buffer: CVPixelBuffer, mode: FrameInterpolationMode) -> Bool {
-        mode != .appleLowLatency && mode != .appleLowLatency4KProxy
+        mode != .appleLowLatency && mode != .appleProxy
     }
 
     private func ensureSession(for buffer: CVPixelBuffer) -> Bool {
@@ -1202,6 +1313,52 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
     }
 }
 
+/// Where video frames come from. Both sources feed `handleVideoFrame`.
+enum VideoSourceKind: Equatable {
+    case captureCard
+    case screen
+}
+
+/// 命令行入口，用于脚本化启动与无人值守测试：
+///   --screen-target=display:first | display:&lt;id&gt; | app:&lt;名称子串&gt; | title:&lt;标题子串&gt;
+///   --request-screen-permission   启动时申请“屏幕录制”权限
+///   --interpolation-mode=&lt;原始值或标签&gt;
+///   --enable-interpolation        首个帧到达后自动开启插帧
+///   --click-through               启动即开启鼠标穿透
+struct LaunchOptions {
+    var screenTarget: String?
+    var requestScreenPermission = false
+    var interpolationMode: FrameInterpolationMode?
+    var enableInterpolation = false
+    var clickThrough = false
+
+    static func parse(_ arguments: [String]) -> LaunchOptions {
+        var options = LaunchOptions()
+        for argument in arguments.dropFirst() {
+            switch argument {
+            case "--request-screen-permission": options.requestScreenPermission = true
+            case "--enable-interpolation": options.enableInterpolation = true
+            case "--click-through": options.clickThrough = true
+            default:
+                if let value = value(of: "--screen-target=", in: argument) {
+                    options.screenTarget = value
+                } else if let value = value(of: "--interpolation-mode=", in: argument) {
+                    options.interpolationMode = FrameInterpolationMode.allCases.first {
+                        $0.label == value || String($0.rawValue) == value
+                    }
+                }
+            }
+        }
+        return options
+    }
+
+    private static func value(of prefix: String, in argument: String) -> String? {
+        guard argument.hasPrefix(prefix) else { return nil }
+        let value = String(argument.dropFirst(prefix.count))
+        return value.isEmpty ? nil : value
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private struct DisplayLatencySample {
         let isInterpolated: Bool
@@ -1219,6 +1376,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     var window: NSWindow!
+    var gameOverlayPanel: GameOverlayPanel?
+    var gameOperationMenuItem: NSMenuItem!
+    var gameOperationOwner: NSRunningApplication?
+    var gameOperationActivationObserver: NSObjectProtocol?
+    var gameOperationVisibilityTimer: Timer?
+    var pendingGameOperationMode = false
     var rootView: NSView!
     var previewView: PreviewView!
     var devicePopup: NSPopUpButton!
@@ -1227,6 +1390,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var isMuted = false
     var audioVolume: Float = 1
     var isAlwaysOnTop = false
+    var isClickThrough = false
 
     var deviceMenu: NSMenu!
     var formatMenu: NSMenu!
@@ -1234,6 +1398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var statusDetailsItem: NSMenuItem!
     var muteMenuItem: NSMenuItem!
     var floatMenuItem: NSMenuItem!
+    var clickThroughMenuItem: NSMenuItem!
     var colorMenuItems: [NSMenuItem] = []
 
     var renderer: MetalRenderer?
@@ -1256,6 +1421,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // macOS capture sessions can renegotiate activeFormat at startRunning. Keep the
     // device configuration lock for the active stream, as OBS does for custom formats.
     var lockedFormatDevice: AVCaptureDevice?
+
+    // 画面来源：采集卡或屏幕捕获。两者共用同一条插帧/呈现链路。
+    var videoSource: VideoSourceKind = .captureCard
+    var screenCaptureSource: ScreenCaptureSource?
+    var screenCaptureToken = UUID()
+    var sourceMenu: NSMenu!
+    var hasSelectedSource = false
+    var welcomeView: WelcomeView?
+    var autoCropScreenCapture = UserDefaults.standard.object(forKey: "autoCropScreenCapture") as? Bool ?? true
+    var uniformProxyFrames = UserDefaults.standard.bool(forKey: "uniformProxyFrames")
+    var uniformProxyMenuItem: NSMenuItem!
+    var screenTargets: [ScreenCaptureSource.Target] = []
+    var selectedScreenTarget: ScreenCaptureSource.Target?
+    var screenTargetsLoading = false
+    var screenContentAccessConfirmed = false
+    var screenTargetsError: String?
+    let launchOptions = LaunchOptions.parse(CommandLine.arguments)
+    var pendingScreenTargetSpec: String?
+    var screenTargetAttempts = 0
+    /// 启动失败过的窗口 ID；重试时跳过，避免一直撞同一个临时窗口。
+    var failedScreenTargetIDs: Set<UInt32> = []
+    /// 需要等首个帧到达、尺寸确定后再应用的插帧方式。
+    var pendingInterpolationMode: FrameInterpolationMode?
 
     struct FormatOption {
         var width: Int32
@@ -1314,7 +1502,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.enqueuePresentationFrames([frame], epoch: epoch, requireInterpolation: true)
         },
         onReport: { [weak self] report in self?.diagnosticLog.append(report) })
+    private let screenContentDetector = ContentFrameCadenceDetector()
+    lazy var screenPresentationScheduler = PresentationScheduler(contentTimed: true,
+        onFrame: { [weak self] frame, epoch in
+            guard let self else { return }
+            self.enqueuePresentationFrames([frame], epoch: epoch, requireInterpolation: true)
+        },
+        onReport: { [weak self] report in self?.diagnosticLog.append(report) })
     var frameInterpolationEnabled = false
+    private var screenOutputSuspended = false
     var frameInterpolationUnavailable = false
     var frameInterpolationEpoch = 0
     var interpolatedFrameCount = 0
@@ -1324,6 +1520,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let diagnosticLog = RollingDiagnosticsLog()
     private let displayTimingQueue = DispatchQueue(label: "switchviewer.display-timing")
     private var displayTimingSamples: [DisplayLatencySample] = []
+    private var shownFrameTimes: [CFTimeInterval] = []
+    private var shownMidpointCount = 0
     private var lastDisplayTimingReportUptime = ProcessInfo.processInfo.systemUptime
     private struct CaptureCallbackTimingSample {
         let ptsToCallbackMilliseconds: Double?
@@ -1343,7 +1541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        diagnosticLog.append("应用启动; macOS=\(ProcessInfo.processInfo.operatingSystemVersionString); 日志目录=\(diagnosticLog.directoryURL.path)")
+        diagnosticLog.append("应用启动; macOS=\(ProcessInfo.processInfo.operatingSystemVersionString); 日志目录=\(diagnosticLog.directoryURL.path); 参数=\(CommandLine.arguments.dropFirst().joined(separator: " "))")
         buildWindow()
         buildMenu()
         do {
@@ -1360,7 +1558,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         diagnosticLog.append("Metal 初始化; result=\(metalInitError ?? "OK"); selfTest=\(metalSelfTest ?? "通过")")
         diagnosticLog.append("低延迟呈现队列; maximumDrawableCount=\(maximumPresentationInFlightFrames); inFlightLimit=\(maximumPresentationInFlightFrames); presentationPacing=\(presentationPacingMode.label); captureCallbackQueueQoS=userInteractive; sourceDedupe=sampledDisplaySignature(Y=256x144,UV=128x72)")
-        refreshDevices(selectPreferred: true)
+        showWelcome()
+        diagnosticLog.append("屏幕捕获权限; granted=\(ScreenCaptureSource.hasPermission); source=\(videoSource == .captureCard ? "captureCard" : "screen")")
+        applyLaunchOptions()
+        if pendingScreenTargetSpec != nil { reloadScreenTargets(userInitiated: false) }
         NotificationCenter.default.addObserver(self, selector: #selector(deviceDisconnected(_:)),
                                                name: .AVCaptureDeviceWasDisconnected, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(deviceConnected(_:)),
@@ -1378,6 +1579,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let observer = gameOperationActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+        stopScreenCapture()
         sessionQueue.sync {
             if session.isRunning { session.stopRunning() }
             setCaptureDisplayAwake(false, reason: "应用退出")
@@ -1410,7 +1615,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let interpolationEnabled = frameInterpolationEnabled
         let interpolatedFrames = interpolatedFrameCount
         let repeatedFrameSkips = interpolationRepeatedFrameSkipCount
-        let presentationPacing = presentationPacingMode.label
+        let presentationPacing = videoSource == .screen && interpolationEnabled
+            ? "按屏幕内容时间戳定时" : presentationPacingMode.label
         let interpolationFailures = interpolationFailureCount
         let interpolationError = lastInterpolationError ?? "无"
         let inputQueueDrops = inputQueueDropCount
@@ -1427,7 +1633,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let actual = currentVideoDevice.map(actualFormatLine) ?? "无设备"
         let signatureCompareAverage = signatureComparisons > 0
             ? signatureCompareTotal / Double(signatureComparisons) : 0
-        diagnosticLog.append("定时状态; session=\(session.isRunning ? "运行中" : "停止"); preset=\(session.sessionPreset.rawValue); device=\(currentVideoDevice?.localizedName ?? "无"); audio=\(currentAudioDevice?.localizedName ?? "无"); requested=\(selected); active=\(actual); buffer=\(width)x\(height) \(pixelFormat); fps=\(String(format: "%.1f", fps)); frames=\(frames); dropped=\(dropped); inputQueueDrops=\(inputQueueDrops); presentationLimitDrops=\(presentationLimitDrops); rendererFailures=\(rendererFailures); signatureDuplicateSourcesSuppressed=\(signatureDuplicateSources); signatureComparisons=\(signatureComparisons); signatureCompareAvgMaxMs=\(String(format: "%.3f/%.3f", signatureCompareAverage, signatureCompareMax)); frameInterpolation=\(interpolationEnabled ? "开" : "关"); interpolationMode=\(frameInterpolationMode.label); presentationPacing=\(presentationPacing); interpolatedFrames=\(interpolatedFrames); repeatedFrameSkips=\(repeatedFrameSkips); interpolationFailures=\(interpolationFailures); interpolationError=\(interpolationError); lastFrame=\(lastFrameAge); renderError=\(renderError); metal=\(metalInitError ?? "OK"); fallback=\(fallbackLayer == nil ? "否" : "是"); color=\(renderer?.colorMode.label ?? "无")")
+        let sourceCounters = screenCaptureSource?.counters ?? (delivered: 0, replayed: 0, empty: 0)
+        let sourceLabel = videoSource == .captureCard ? "captureCard" : "screen"
+        diagnosticLog.append("定时状态; source=\(sourceLabel); screenDelivered=\(sourceCounters.delivered); screenReplayed=\(sourceCounters.replayed); screenEmptyCallback=\(sourceCounters.empty); session=\(session.isRunning ? "运行中" : "停止"); preset=\(session.sessionPreset.rawValue); device=\(currentVideoDevice?.localizedName ?? "无"); audio=\(currentAudioDevice?.localizedName ?? "无"); requested=\(selected); active=\(actual); buffer=\(width)x\(height) \(pixelFormat); submittedFPS=\(String(format: "%.1f", fps)); frames=\(frames); dropped=\(dropped); inputQueueDrops=\(inputQueueDrops); presentationLimitDrops=\(presentationLimitDrops); rendererFailures=\(rendererFailures); signatureDuplicateSourcesSuppressed=\(signatureDuplicateSources); signatureComparisons=\(signatureComparisons); signatureCompareAvgMaxMs=\(String(format: "%.3f/%.3f", signatureCompareAverage, signatureCompareMax)); frameInterpolation=\(interpolationEnabled ? "开" : "关"); interpolationMode=\(frameInterpolationMode.label); presentationPacing=\(presentationPacing); interpolatedFrames=\(interpolatedFrames); repeatedFrameSkips=\(repeatedFrameSkips); interpolationFailures=\(interpolationFailures); interpolationError=\(interpolationError); lastFrame=\(lastFrameAge); renderError=\(renderError); metal=\(metalInitError ?? "OK"); fallback=\(fallbackLayer == nil ? "否" : "是"); color=\(renderer?.colorMode.label ?? "无")")
     }
 
     // Metal 不可用时切回系统预览层，保证不断片
@@ -1443,6 +1651,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let interpolationEngine = self.frameInterpolationEngine
             self.frameLock.unlock()
             self.presentationScheduler.reset(epoch: epoch)
+            self.resetScreenTiming(epoch: epoch)
             interpolationEngine?.reset()
             let l = AVCaptureVideoPreviewLayer(session: self.session)
             l.videoGravity = .resizeAspect
@@ -1493,6 +1702,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     // MARK: UI
+
+    func showWelcome(message: String? = nil) {
+        welcomeView?.removeFromSuperview()
+        let welcome = WelcomeView(frame: rootView.bounds, message: message)
+        welcome.autoresizingMask = [.width, .height]
+        welcome.onChooseScreen = { [weak self] button in
+            self?.chooseScreenFromWelcome(button)
+        }
+        welcome.onChooseDevice = { [weak self] button in
+            guard let self else { return }
+            self.refreshDevices(selectPreferred: true, startIfSelected: false)
+            self.deviceMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+        }
+        rootView.addSubview(welcome)
+        welcomeView = welcome
+        window.minSize = NSSize(width: 640, height: 520)
+        window.title = "SwitchViewer"
+        setStatus(message ?? "请选择画面来源")
+    }
+
+    func dismissWelcome() {
+        hasSelectedSource = true
+        welcomeView?.removeFromSuperview()
+        welcomeView = nil
+        window.minSize = NSSize(width: 640, height: 400)
+    }
+
+    func chooseScreenFromWelcome(_ button: NSButton) {
+            reloadScreenTargets(userInitiated: true) { [weak self, weak button] in
+                guard let self, let button, self.welcomeView != nil else { return }
+                self.sourceMenu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+            }
+    }
 
     func buildWindow() {
         window = NSWindow(
@@ -1555,7 +1797,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         appItem.submenu = appMenu
 
         deviceMenu = NSMenu(title: "采集卡")
+        let chooseDevice = NSMenuItem(title: "选择采集卡或摄像头…", action: #selector(selectCaptureCardSource(_:)), keyEquivalent: "")
+        chooseDevice.target = self
+        deviceMenu.addItem(chooseDevice)
         formatMenu = NSMenu(title: "分辨率")
+        sourceMenu = NSMenu(title: "画面来源")
 
         let audioMenu = NSMenu(title: "音频")
         muteMenuItem = NSMenuItem(title: "静音", action: #selector(toggleMute(_:)), keyEquivalent: "m")
@@ -1581,6 +1827,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         floatMenuItem = NSMenuItem(title: "窗口置顶", action: #selector(toggleFloat(_:)), keyEquivalent: "")
         floatMenuItem.target = self
         windowMenu.addItem(floatMenuItem)
+        clickThroughMenuItem = NSMenuItem(title: "鼠标穿透（盖在游戏上时开启）",
+                                          action: #selector(toggleClickThrough(_:)), keyEquivalent: "")
+        clickThroughMenuItem.target = self
+        windowMenu.addItem(clickThroughMenuItem)
+        gameOperationMenuItem = NSMenuItem(title: "游戏操作模式（手柄交给游戏）",
+                                           action: #selector(toggleGameOperationMode(_:)), keyEquivalent: "g")
+        gameOperationMenuItem.keyEquivalentModifierMask = [.command, .shift]
+        gameOperationMenuItem.target = self
+        windowMenu.addItem(gameOperationMenuItem)
+        let gameHint = NSMenuItem(title: "返回设置：点 Dock 中的 SwitchViewer 或切回此应用", action: nil, keyEquivalent: "")
+        gameHint.isEnabled = false
+        windowMenu.addItem(gameHint)
 
         let pictureMenu = NSMenu(title: "画面")
         let screenshot = NSMenuItem(title: "保存截图到图片文件夹", action: #selector(takeScreenshot(_:)), keyEquivalent: "s")
@@ -1610,7 +1868,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item.target = self
             item.tag = mode.rawValue
             item.state = mode == frameInterpolationMode ? .on : .off
-            if mode == .appleLowLatency || mode == .appleLowLatency4KProxy { item.isEnabled = false }
+            if mode == .appleLowLatency || mode == .appleProxy { item.isEnabled = false }
             interpolationModeMenu.addItem(item)
             return item
         }
@@ -1623,7 +1881,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         frameInterpolationMenuItem = NSMenuItem(title: "插帧（实验·跳过重复帧）", action: #selector(toggleFrameInterpolation(_:)), keyEquivalent: "")
         frameInterpolationMenuItem.target = self
         pictureMenu.addItem(frameInterpolationMenuItem)
-        let presentationPacingParent = NSMenuItem(title: "呈现节奏", action: nil, keyEquivalent: "")
+        uniformProxyMenuItem = NSMenuItem(title: "原始帧也按插帧分辨率处理（更柔和）", action: #selector(toggleUniformProxyFrames(_:)), keyEquivalent: "")
+        uniformProxyMenuItem.target = self
+        uniformProxyMenuItem.state = uniformProxyFrames ? .on : .off
+        pictureMenu.addItem(uniformProxyMenuItem)
+        let presentationPacingParent = NSMenuItem(title: "采集卡呈现节奏", action: nil, keyEquivalent: "")
         let presentationPacingMenu = NSMenu(title: "呈现节奏")
         presentationPacingMenuItems = PresentationPacingMode.allCases.map { mode in
             let item = NSMenuItem(title: mode.label,
@@ -1659,6 +1921,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusDetailsItem.isEnabled = false
         statusMenu.addItem(statusDetailsItem)
 
+        addTopLevelMenu("画面来源", menu: sourceMenu, to: main)
         addTopLevelMenu("采集卡", menu: deviceMenu, to: main)
         addTopLevelMenu("分辨率", menu: formatMenu, to: main)
         addTopLevelMenu("音频", menu: audioMenu, to: main)
@@ -1666,6 +1929,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         addTopLevelMenu("画面", menu: pictureMenu, to: main)
         addTopLevelMenu("诊断", menu: diagnosticsMenu, to: main)
         addTopLevelMenu("状态", menu: statusMenu, to: main)
+        refreshSourceMenu()
         NSApp.mainMenu = main
     }
 
@@ -1679,10 +1943,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowDidChangeBackingProperties(_ notification: Notification) {
         // 换显示器 / 缩放变化时跟上 DPI
-        let s = window?.backingScaleFactor ?? 2.0
+        let s = previewView.window?.backingScaleFactor ?? 2.0
         previewView.metalLayer.contentsScale = s
         previewView.fallbackLayer?.contentsScale = s
         previewView.needsLayout = true
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        guard pendingGameOperationMode else { return }
+        pendingGameOperationMode = false
+        enterGameOperationMode()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        leaveGameOperationMode()
+        window.makeKeyAndOrderFront(nil)
+        return true
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        // Command-Tab and the Dock provide an escape without intercepting game keys.
+        if gameOverlayPanel != nil { leaveGameOperationMode() }
+    }
+
+    @objc func toggleGameOperationMode(_ sender: Any?) {
+        if gameOverlayPanel != nil { leaveGameOperationMode(); return }
+        guard videoSource == .screen, selectedScreenTarget?.kind == .window,
+              selectedScreenTarget?.processID != nil else {
+            setStatus("请先选择游戏窗口，再开启游戏操作模式", base: false)
+            return
+        }
+        if window.styleMask.contains(.fullScreen) {
+            pendingGameOperationMode = true
+            window.toggleFullScreen(nil)
+        } else { enterGameOperationMode() }
+    }
+
+    func enterGameOperationMode() {
+        guard gameOverlayPanel == nil, videoSource == .screen,
+              let pid = selectedScreenTarget?.processID,
+              pid != ProcessInfo.processInfo.processIdentifier,
+              let owner = NSRunningApplication(processIdentifier: pid), !owner.isTerminated,
+              let screen = window.screen ?? NSScreen.main else {
+            setStatus("游戏窗口已不可用，请重新选择画面来源", base: false)
+            return
+        }
+        let panel = GameOverlayPanel(screen: screen)
+        gameOverlayPanel = panel
+        gameOperationOwner = owner
+        window.orderOut(nil)
+        window.contentView = nil
+        panel.contentView = rootView
+        rootView.frame = NSRect(origin: .zero, size: screen.frame.size)
+        panel.delegate = self
+        previewView.needsLayout = true
+        previewView.layoutSubtreeIfNeeded()
+        gameOperationMenuItem.state = .on
+        if !owner.activate(options: [.activateIgnoringOtherApps, .activateAllWindows]) {
+            leaveGameOperationMode()
+            setStatus("无法将焦点交给游戏，请确认游戏仍在运行", base: false)
+            return
+        }
+        updateGameOverlayVisibility()
+        gameOperationVisibilityTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.updateGameOverlayVisibility()
+        }
+        gameOperationActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            self?.updateGameOverlayVisibility()
+        }
+        diagnosticLog.append("游戏操作模式; enabled=true; gamePID=\(pid); overlayWindow=\(panel.windowNumber); overlayCanBecomeKey=\(panel.canBecomeKey)")
+    }
+
+    func updateGameOverlayVisibility() {
+        guard let panel = gameOverlayPanel, let owner = gameOperationOwner else { return }
+        frameLock.lock()
+        let hasFrame = lastWidth > 0 && lastHeight > 0
+        screenOutputSuspended = !owner.isActive
+        frameLock.unlock()
+        // Leave the actual game visible while waiting for the first capture frame.
+        let shouldShow = hasFrame && owner.isActive
+        if shouldShow && !panel.isVisible { panel.orderFrontRegardless() }
+        else if !shouldShow && panel.isVisible { panel.orderOut(nil) }
+    }
+
+    func leaveGameOperationMode() {
+        pendingGameOperationMode = false
+        guard let panel = gameOverlayPanel else { return }
+        gameOperationVisibilityTimer?.invalidate()
+        gameOperationVisibilityTimer = nil
+        if let observer = gameOperationActivationObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            gameOperationActivationObserver = nil
+        }
+        panel.orderOut(nil)
+        panel.contentView = nil
+        window.contentView = rootView
+        rootView.frame = NSRect(origin: .zero, size: window.contentLayoutRect.size)
+        panel.close()
+        gameOverlayPanel = nil
+        gameOperationOwner = nil
+        frameLock.lock()
+        screenOutputSuspended = false
+        frameLock.unlock()
+        gameOperationMenuItem.state = .off
+        previewView.needsLayout = true
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        diagnosticLog.append("游戏操作模式; enabled=false")
     }
 
     // MARK: 设备插拔（采集卡重插后自动恢复）
@@ -1723,7 +2092,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         AVCaptureDevice.devices(for: .audio)
     }
 
-    func refreshDevices(selectPreferred: Bool) {
+    func refreshDevices(selectPreferred: Bool, startIfSelected: Bool = true) {
         let keepID = devicePopup.selectedItem?.representedObject as? String
             ?? currentVideoDevice?.uniqueID
         devicePopup.removeAllItems()
@@ -1746,7 +2115,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             devicePopup.selectItem(at: idx)
         }
         updateDeviceMenu()
-        rebuildFormatsAndStart()
+        if startIfSelected && hasSelectedSource && videoSource == .captureCard,
+           keepID == devicePopup.selectedItem?.representedObject as? String {
+            rebuildFormatsAndStart()
+        }
     }
 
     func updateDeviceMenu() {
@@ -1941,19 +2313,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: Session
 
     func startSession(video: AVCaptureDevice, formatIndex: Int) {
-        frameLock.lock()
-        frameInterpolationEpoch += 1
-        let epoch = frameInterpolationEpoch
-        detectedGameFPS = nil
-        clearDeadlineCadenceQualificationLocked()
-        let interpolationEngine = frameInterpolationEngine
-        interpolatedFrameCount = 0
-        interpolationRepeatedFrameSkipCount = 0
-        interpolationFailureCount = 0
-        lastInterpolationError = nil
-        frameLock.unlock()
-        presentationScheduler.reset(epoch: epoch)
-        interpolationEngine?.reset()
+        dismissWelcome()
+        // 任何采集卡操作都隐含"切回采集卡"，否则屏幕捕获会继续占用同一条链路。
+        if videoSource == .screen {
+            stopScreenCapture()
+            videoSource = .captureCard
+            selectedScreenTarget = nil
+            refreshSourceMenu()
+            diagnosticLog.append("切换画面来源; source=captureCard; reason=启动采集会话")
+        }
+        beginNewSourceGeneration(reason: "采集卡会话 \(video.localizedName)")
         let opt = formatOptions.indices.contains(formatIndex) ? formatOptions[formatIndex] : nil
         let requested = opt?.label ?? "未知格式[\(formatIndex)]"
         let initialAudioVolume = isMuted ? Float(0) : audioVolume
@@ -1968,39 +2337,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 self.lockedFormatDevice = nil
                 self.diagnosticLog.append("停止旧流并释放设备格式锁; device=\(locked.localizedName)")
             }
-            // 重置帧统计
-            self.frameLock.lock()
-            self.frameCount = 0
-            self.droppedCount = 0
-            self.inputQueueDropCount = 0
-            self.presentationLimitDropCount = 0
-            self.rendererFailureCount = 0
-            self.signatureDuplicateSourceCount = 0
-            self.signatureCompareCount = 0
-            self.signatureCompareTotalMilliseconds = 0
-            self.signatureCompareMaxMilliseconds = 0
-            self.lastAcceptedSourceSignature = nil
-            self.consecFails = 0
-            self.didLogRenderFailure = false
-            self.firstRenderError = nil
-            self.lastRenderError = nil
-            self.lastSetDesc = nil
-            self.setVerifyDesc = nil
-            self.lastPixelBuffer = nil
-            self.lastPixelFormat = 0
-            self.lastWidth = 0
-            self.lastHeight = 0
-            self.lastFrameDate = nil
-            self.interpolatedFrameCount = 0
-            self.interpolationRepeatedFrameSkipCount = 0
-            self.interpolationFailureCount = 0
-            self.lastInterpolationError = nil
-            self.tickCount = 0
-            self.tickDate = Date()
-            self.measuredFps = 0
-            self.sessionGeneration += 1
+            // 帧统计已由 beginNewSourceGeneration 重置。
             let gen = self.sessionGeneration
-            self.frameLock.unlock()
 
             // 选定的 AVCaptureDevice.Format 是分辨率/帧率的唯一依据。
             self.session.beginConfiguration()
@@ -2158,6 +2496,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: Actions
 
     @objc func deviceChanged(_ sender: Any) {
+        leaveGameOperationMode()
+        dismissWelcome()
         updateDeviceMenu()
         rebuildFormatsAndStart()
     }
@@ -2192,10 +2532,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func goFullscreen(_ sender: Any) { window.toggleFullScreen(nil) }
 
+    @objc func toggleUniformProxyFrames(_ sender: Any) {
+        frameLock.lock()
+        uniformProxyFrames.toggle()
+        let enabled = uniformProxyFrames
+        frameLock.unlock()
+        UserDefaults.standard.set(enabled, forKey: "uniformProxyFrames")
+        uniformProxyMenuItem.state = enabled ? .on : .off
+        diagnosticLog.append("原始帧代理缩放; enabled=\(enabled)")
+        setStatus(enabled ? "Apple 代理插帧：所有帧统一清晰度" : "原始帧保留完整清晰度", base: false)
+    }
+
     @objc func toggleFloat(_ sender: Any) {
         isAlwaysOnTop.toggle()
         floatMenuItem.state = isAlwaysOnTop ? .on : .off
         window.level = isAlwaysOnTop ? .floating : .normal
+    }
+
+    /// 屏幕捕获用来盖在游戏上时，窗口必须放行鼠标，否则点击会被预览窗吞掉。
+    @objc func toggleClickThrough(_ sender: Any) {
+        isClickThrough.toggle()
+        window.ignoresMouseEvents = isClickThrough
+        clickThroughMenuItem.state = isClickThrough ? .on : .off
+        if isClickThrough, !isAlwaysOnTop {
+            // 穿透后无法再用鼠标移动/关闭窗口，顺手置顶，避免被游戏盖住。
+            isAlwaysOnTop = true
+            floatMenuItem.state = .on
+            window.level = .floating
+        }
+        setStatus(isClickThrough
+                  ? "鼠标穿透已开启：点击与拖动会传给下层窗口，用菜单关闭"
+                  : "鼠标穿透已关闭", base: false)
+        diagnosticLog.append("鼠标穿透; enabled=\(isClickThrough)")
     }
 
     @objc func cycleColor(_ sender: Any) {
@@ -2211,7 +2579,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func selectFrameInterpolationMode(_ sender: NSMenuItem) {
         guard let mode = FrameInterpolationMode(rawValue: sender.tag) else { return }
-        if mode == .appleLowLatency || mode == .appleLowLatency4KProxy {
+        applyFrameInterpolationMode(mode)
+    }
+
+    func applyFrameInterpolationMode(_ mode: FrameInterpolationMode) {
+        if mode == .appleLowLatency || mode == .appleProxy {
             frameLock.lock()
             let width = lastWidth
             let height = lastHeight
@@ -2219,12 +2591,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             frameLock.unlock()
             let available = mode == .appleLowLatency
                 ? canUseAppleLowLatencyFrame(width: width, height: height, pixelFormat: pixelFormat)
-                : canUseAppleLowLatency4KProxy(width: width, height: height, pixelFormat: pixelFormat)
+                : canUseAppleProxy(width: width, height: height, pixelFormat: pixelFormat)
             guard available else {
                 updateAppleLowLatencyMenuAvailability()
                 setStatus(mode == .appleLowLatency
                     ? "Apple 原生低延迟插帧需要 1920×1080 NV12 输入"
-                    : "Apple 4K 代理插帧需要 3840×2160 NV12 输入", base: false)
+                    : "Apple 代理插帧需要至少 1024×576 的 NV12 输入", base: false)
                 return
             }
         }
@@ -2242,6 +2614,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let engine = frameInterpolationEngine
         frameLock.unlock()
         presentationScheduler.reset(epoch: epoch)
+        resetScreenTiming(epoch: epoch)
         engine?.setMode(mode)
         for item in frameInterpolationModeMenuItems {
             item.state = item.tag == mode.rawValue ? .on : .off
@@ -2251,6 +2624,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc func selectPresentationPacing(_ sender: NSMenuItem) {
+        guard videoSource != .screen else {
+            setStatus("游戏窗口会自动匹配画面更新节奏，无需选择采集卡节奏", base: false)
+            return
+        }
         guard let mode = PresentationPacingMode(rawValue: sender.tag) else { return }
         frameLock.lock()
         guard presentationPacingMode != mode else {
@@ -2263,6 +2640,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         clearDeadlineCadenceQualificationLocked()
         frameLock.unlock()
         presentationScheduler.reset(epoch: epoch)
+        resetScreenTiming(epoch: epoch)
         for item in presentationPacingMenuItems {
             item.state = item.tag == mode.rawValue ? .on : .off
         }
@@ -2281,8 +2659,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             case .appleLowLatency:
                 item.isEnabled = canUseAppleLowLatencyFrame(width: width, height: height,
                                                             pixelFormat: pixelFormat)
-            case .appleLowLatency4KProxy:
-                item.isEnabled = canUseAppleLowLatency4KProxy(width: width, height: height,
+            case .appleProxy:
+                item.isEnabled = canUseAppleProxy(width: width, height: height,
                                                               pixelFormat: pixelFormat)
             default:
                 break
@@ -2325,9 +2703,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                         self.frameLock.lock()
                         let changed = self.detectedGameFPS != gameFPS
                         self.detectedGameFPS = gameFPS
+                        if self.videoSource == .screen {
+                            self.frameLock.unlock()
+                            if changed {
+                                self.diagnosticLog.append("屏幕内容更新率; observedFPS=\(gameFPS.map { String(format: "%.1f", $0) } ?? "预热中")")
+                            }
+                            return
+                        }
                         let isDeadlineCadence = gameFPS.map { abs($0 - 30) <= 2 } ?? false
                         let schedulerSelected = self.presentationPacingMode == .deadlineScheduled
-                            && self.frameInterpolationMode == .appleLowLatency4KProxy
+                            && self.frameInterpolationMode == .appleProxy
                         var shouldResetScheduler = false
                         var schedulerResetReason: String?
                         if !schedulerSelected {
@@ -2413,6 +2798,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let activeEngine = frameInterpolationEngine
         frameLock.unlock()
         presentationScheduler.reset(epoch: epoch)
+        resetScreenTiming(epoch: epoch)
         activeEngine?.reset()
 
         let message = shouldEnable
@@ -2610,13 +2996,416 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
 extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
     func hostTime(forCaptureTimestamp timestamp: CMTime) -> CFTimeInterval? {
-        guard CMTimeGetSeconds(timestamp).isFinite,
-              let captureClock = session.synchronizationClock else { return nil }
-        let hostTimestamp = CMSyncConvertTime(timestamp,
-                                              from: captureClock,
-                                              to: CMClockGetHostTimeClock())
-        let seconds = CMTimeGetSeconds(hostTimestamp)
-        return seconds.isFinite ? seconds : nil
+        guard CMTimeGetSeconds(timestamp).isFinite else { return nil }
+        switch videoSource {
+        case .captureCard:
+            guard let captureClock = session.synchronizationClock else { return nil }
+            let hostTimestamp = CMSyncConvertTime(timestamp,
+                                                  from: captureClock,
+                                                  to: CMClockGetHostTimeClock())
+            let seconds = CMTimeGetSeconds(hostTimestamp)
+            return seconds.isFinite ? seconds : nil
+        case .screen:
+            // ScreenCaptureKit already stamps sample buffers on the host clock.
+            let seconds = CMTimeGetSeconds(timestamp)
+            return seconds.isFinite ? seconds : nil
+        }
+    }
+
+    // MARK: 画面来源切换
+
+    /// Bumps the frame epoch and clears per-session counters. Shared by the
+    /// capture-card session and the screen-capture source so frames from the
+    /// previous source can never be presented after a switch.
+    @discardableResult
+    func beginNewSourceGeneration(reason: String) -> Int {
+        frameLock.lock()
+        frameInterpolationEpoch += 1
+        let epoch = frameInterpolationEpoch
+        detectedGameFPS = nil
+        clearDeadlineCadenceQualificationLocked()
+        interpolatedFrameCount = 0
+        interpolationRepeatedFrameSkipCount = 0
+        interpolationFailureCount = 0
+        lastInterpolationError = nil
+        frameCount = 0
+        droppedCount = 0
+        inputQueueDropCount = 0
+        presentationLimitDropCount = 0
+        rendererFailureCount = 0
+        signatureDuplicateSourceCount = 0
+        signatureCompareCount = 0
+        signatureCompareTotalMilliseconds = 0
+        signatureCompareMaxMilliseconds = 0
+        lastAcceptedSourceSignature = nil
+        consecFails = 0
+        didLogRenderFailure = false
+        firstRenderError = nil
+        lastRenderError = nil
+        lastSetDesc = nil
+        setVerifyDesc = nil
+        lastPixelBuffer = nil
+        lastPixelFormat = 0
+        lastWidth = 0
+        lastHeight = 0
+        lastFrameDate = nil
+        tickCount = 0
+        tickDate = Date()
+        measuredFps = 0
+        sessionGeneration += 1
+        let generation = sessionGeneration
+        let interpolationEngine = frameInterpolationEngine
+        frameLock.unlock()
+        presentationScheduler.reset(epoch: epoch)
+        resetScreenTiming(epoch: epoch)
+        interpolationEngine?.reset()
+        diagnosticLog.append("开始新的画面来源代次; reason=\(reason); epoch=\(epoch); generation=\(generation)")
+        return generation
+    }
+
+    func resetScreenTiming(epoch: Int) {
+        frameLock.lock()
+        screenContentDetector.reset()
+        frameLock.unlock()
+        screenPresentationScheduler.reset(epoch: epoch)
+    }
+
+    func handleScreenCaptureFrame(_ frame: ScreenCaptureSource.Frame) {
+        guard videoSource == .screen else { return }
+        frameLock.lock()
+        let skipIdle = frameInterpolationEnabled && frame.isReplayed
+        let suspended = screenOutputSuspended
+        if skipIdle { interpolationRepeatedFrameSkipCount += 1 }
+        frameLock.unlock()
+        guard !skipIdle && !suspended else { return }
+        let callbackWorkStart = ProcessInfo.processInfo.systemUptime
+        let presentationTimestampHostTime = hostTime(forCaptureTimestamp: frame.presentationTimeStamp)
+        var ptsToCallbackMilliseconds: Double?
+        if let presentationTimestampHostTime,
+           frame.callbackHostTime >= presentationTimestampHostTime {
+            ptsToCallbackMilliseconds = (frame.callbackHostTime - presentationTimestampHostTime) * 1_000
+        }
+        let signatureSamplingMilliseconds = handleVideoFrame(
+            pixelBuffer: frame.pixelBuffer,
+            presentationTimeStamp: frame.presentationTimeStamp,
+            captureCallbackHostTime: frame.callbackHostTime,
+            presentationTimestampHostTime: presentationTimestampHostTime)
+        let callbackWorkMilliseconds = (ProcessInfo.processInfo.systemUptime - callbackWorkStart) * 1_000
+        recordCaptureCallbackTiming(ptsToCallbackMilliseconds: ptsToCallbackMilliseconds,
+                                    callbackWorkMilliseconds: callbackWorkMilliseconds,
+                                    signatureSamplingMilliseconds: signatureSamplingMilliseconds)
+    }
+
+    func ownWindowNumbers() -> Set<CGWindowID> {
+        Set(NSApp.windows.map { CGWindowID($0.windowNumber) })
+    }
+
+    /// `display:first` / `display:<id>` / `app:<名称子串>` / `title:<标题子串>`
+    func resolveScreenTarget(_ spec: String) -> ScreenCaptureSource.Target? {
+        let parts = spec.split(separator: ":", maxSplits: 1).map(String.init)
+        let kind = parts.first ?? ""
+        let value = parts.count > 1 ? parts[1] : ""
+        switch kind {
+        case "display":
+            if value.isEmpty || value == "first" {
+                return screenTargets.first { $0.kind == .display }
+            }
+            guard let id = UInt32(value) else { return nil }
+            return screenTargets.first { $0.kind == .display && $0.id == id }
+        case "app", "title":
+            guard !value.isEmpty else { return nil }
+            let windows = screenTargets.filter {
+                $0.kind == .window && !failedScreenTargetIDs.contains($0.id)
+            }
+            let matches = kind == "app"
+                ? windows.filter { $0.applicationName.localizedCaseInsensitiveContains(value) }
+                : windows.filter { $0.title.localizedCaseInsensitiveContains(value) }
+            // 同名窗口可能有多个，取面积最大的那个（通常就是游戏主窗口）。
+            return matches.max { $0.width * $0.height < $1.width * $1.height }
+        default:
+            return nil
+        }
+    }
+
+    func applyLaunchOptions() {
+        guard launchOptions.screenTarget != nil
+            || launchOptions.requestScreenPermission
+            || launchOptions.enableInterpolation
+            || launchOptions.interpolationMode != nil
+            || launchOptions.clickThrough else { return }
+        diagnosticLog.append("启动参数; screenTarget=\(launchOptions.screenTarget ?? "-")"
+                             + "; requestPermission=\(launchOptions.requestScreenPermission)"
+                             + "; interpolationMode=\(launchOptions.interpolationMode?.label ?? "-")"
+                             + "; enableInterpolation=\(launchOptions.enableInterpolation)"
+                             + "; clickThrough=\(launchOptions.clickThrough)")
+        if launchOptions.clickThrough, !isClickThrough { toggleClickThrough(self) }
+        if launchOptions.requestScreenPermission, !ScreenCaptureSource.hasPermission {
+            let granted = ScreenCaptureSource.requestPermission()
+            diagnosticLog.append("启动参数申请屏幕录制权限; granted=\(granted)")
+        }
+        if launchOptions.enableInterpolation || launchOptions.interpolationMode != nil {
+            pendingInterpolationMode = launchOptions.interpolationMode ?? .appleProxy
+        }
+        pendingScreenTargetSpec = launchOptions.screenTarget
+    }
+
+    /// 启动参数指定的插帧方式要等首个帧到达、缓冲尺寸确定后才能通过可用性检查。
+    func applyPendingInterpolationIfNeeded() {
+        if let requested = pendingInterpolationMode {
+            pendingInterpolationMode = nil
+            applyFrameInterpolationMode(requested)
+        }
+        guard launchOptions.enableInterpolation else { return }
+        frameLock.lock()
+        let enabled = frameInterpolationEnabled
+        frameLock.unlock()
+        if !enabled { toggleFrameInterpolation(self) }
+    }
+
+    func startScreenCapture(target: ScreenCaptureSource.Target) {
+        leaveGameOperationMode()
+        dismissWelcome()
+        beginNewSourceGeneration(reason: "屏幕捕获 \(target.menuTitle)")
+        stopScreenCapture()
+        let captureToken = UUID()
+        screenCaptureToken = captureToken
+        videoSource = .screen
+        selectedScreenTarget = target
+        refreshSourceMenu()
+        diagnosticLog.append("切换画面来源; source=screen; target=\(target.menuTitle); points=\(target.width)x\(target.height)")
+
+        // 采集卡必须让出链路：两条来源共用同一个帧入口。
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.setCaptureDisplayAwake(false, reason: "切换到屏幕捕获")
+            if self.session.isRunning { self.session.stopRunning() }
+            if let locked = self.lockedFormatDevice {
+                locked.unlockForConfiguration()
+                self.lockedFormatDevice = nil
+                self.diagnosticLog.append("屏幕捕获接管，已释放采集卡格式锁; device=\(locked.localizedName)")
+            }
+        }
+
+        let source = ScreenCaptureSource(
+            onFrame: { [weak self] frame in self?.handleScreenCaptureFrame(frame) },
+            onError: { [weak self] message in
+                DispatchQueue.main.async {
+                    guard let self, self.screenCaptureToken == captureToken else { return }
+                    self.returnToSourceSelection(message: message)
+                }
+            },
+            autoCrop: autoCropScreenCapture,
+            onCrop: { [weak self] message in self?.diagnosticLog.append(message) })
+        screenCaptureSource = source
+        source.start(target: target, excludingWindowNumbers: ownWindowNumbers()) { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard self.screenCaptureToken == captureToken,
+                      self.videoSource == .screen, self.selectedScreenTarget == target else { return }
+                guard let error else {
+                    let size = source.capturedSize
+                    self.screenTargetAttempts = 0
+                    self.pendingScreenTargetSpec = nil
+                    self.setStatus("屏幕捕获 · \(target.menuTitle) · \(size.width)×\(size.height)")
+                    self.window.title = "SwitchViewer - 屏幕捕获"
+                    self.setCaptureDisplayAwake(true, reason: "屏幕捕获运行中")
+                    self.previewView.needsLayout = true
+                    self.previewView.layoutSubtreeIfNeeded()
+                    return
+                }
+                self.diagnosticLog.append("屏幕捕获启动失败; target=\(target.menuTitle); error=\(error.localizedDescription)")
+                self.setStatus("屏幕捕获启动失败：\(error.localizedDescription)", base: false)
+                self.failedScreenTargetIDs.insert(target.id)
+                if self.pendingScreenTargetSpec != nil {
+                    self.retryScreenTargetIfPossible()
+                } else {
+                    self.returnToSourceSelection(message: "所选来源无法捕获，请重新选择画面来源")
+                }
+            }
+        }
+    }
+
+    /// 启动参数指定的窗口可能是启动器/加载中的临时窗口，窗口 ID 在列举与启动之间就会失效。
+    /// 有目标规格时按退避重试，直到拿到一个稳定的窗口或达到上限。
+    func retryScreenTargetIfPossible() {
+        guard let spec = pendingScreenTargetSpec else { return }
+        guard screenTargetAttempts < 8 else {
+            pendingScreenTargetSpec = nil
+            screenTargetAttempts = 0
+            diagnosticLog.append("屏幕目标重试次数用尽; spec=\(spec)")
+            returnToSourceSelection(message: "找不到可用的捕获窗口，请重新选择画面来源")
+            return
+        }
+        screenTargetAttempts += 1
+        let attempt = screenTargetAttempts
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self, self.pendingScreenTargetSpec != nil else { return }
+            self.diagnosticLog.append("重试屏幕目标; spec=\(spec); attempt=\(attempt)")
+            self.reloadScreenTargets(userInitiated: false)
+        }
+    }
+
+    func stopScreenCapture() {
+        screenCaptureToken = UUID()
+        guard let source = screenCaptureSource else { return }
+        screenCaptureSource = nil
+        source.stop()
+    }
+
+    func returnToSourceSelection(message: String) {
+        guard videoSource == .screen, hasSelectedSource else { return }
+        leaveGameOperationMode()
+        diagnosticLog.append("屏幕来源失效，返回来源选择; \(message)")
+        pendingScreenTargetSpec = nil
+        pendingInterpolationMode = nil
+        screenTargetAttempts = 0
+        failedScreenTargetIDs.removeAll()
+        stopScreenCapture()
+        frameLock.lock()
+        frameInterpolationEnabled = false
+        frameLock.unlock()
+        beginNewSourceGeneration(reason: "捕获来源已失效")
+        frameInterpolationMenuItem.state = .off
+        frameInterpolationMenuItem.title = "插帧（实验·跳过重复帧）"
+        selectedScreenTarget = nil
+        hasSelectedSource = false
+        videoSource = .captureCard
+        measuredFps = 0
+        // The source picker must remain clickable even after an overlay session.
+        isClickThrough = false
+        window.ignoresMouseEvents = false
+        clickThroughMenuItem.state = .off
+        isAlwaysOnTop = false
+        window.level = .normal
+        floatMenuItem.state = .off
+        setCaptureDisplayAwake(false, reason: "捕获来源已失效")
+        refreshSourceMenu()
+        showWelcome(message: message)
+    }
+
+    func refreshSourceMenu() {
+        sourceMenu?.removeAllItems()
+        guard let sourceMenu else { return }
+
+        let cardItem = NSMenuItem(title: "采集卡（UVC / HDMI）",
+                                  action: #selector(selectCaptureCardSource(_:)),
+                                  keyEquivalent: "")
+        cardItem.target = self
+        cardItem.state = hasSelectedSource && videoSource == .captureCard ? .on : .off
+        sourceMenu.addItem(cardItem)
+        sourceMenu.addItem(.separator())
+
+        guard ScreenCaptureSource.hasPermission || screenContentAccessConfirmed || screenTargetsLoading else {
+            let request = NSMenuItem(title: "申请“屏幕录制”权限…",
+                                     action: #selector(requestScreenPermission(_:)),
+                                     keyEquivalent: "")
+            request.target = self
+            sourceMenu.addItem(request)
+            let hint = NSMenuItem(title: "已开启仍不可用？移除旧条目后重新添加此 App",
+                                  action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            sourceMenu.addItem(hint)
+            let retry = NSMenuItem(title: "重新检查权限与来源", action: #selector(refreshScreenTargets(_:)), keyEquivalent: "")
+            retry.target = self
+            sourceMenu.addItem(retry)
+            return
+        }
+
+        let header = NSMenuItem(title: "屏幕与窗口", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        sourceMenu.addItem(header)
+
+        if screenTargets.isEmpty {
+            let empty = NSMenuItem(title: screenTargetsLoading ? "正在读取…" : (screenTargetsError == nil ? "没有可捕获的目标" : "来源读取失败，请重新检查权限"),
+                                   action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            sourceMenu.addItem(empty)
+        }
+        for (index, target) in screenTargets.enumerated() {
+            let item = NSMenuItem(title: target.menuTitle,
+                                  action: #selector(selectScreenSource(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.tag = index
+            if videoSource == .screen, selectedScreenTarget == target { item.state = .on }
+            sourceMenu.addItem(item)
+        }
+        sourceMenu.addItem(.separator())
+        let cropItem = NSMenuItem(title: "自动裁切顶部系统栏", action: #selector(toggleScreenAutoCrop(_:)), keyEquivalent: "")
+        cropItem.target = self
+        cropItem.state = autoCropScreenCapture ? .on : .off
+        sourceMenu.addItem(cropItem)
+        let refresh = NSMenuItem(title: "刷新列表",
+                                 action: #selector(refreshScreenTargets(_:)), keyEquivalent: "")
+        refresh.target = self
+        sourceMenu.addItem(refresh)
+    }
+
+    @objc func toggleScreenAutoCrop(_ sender: Any?) {
+        autoCropScreenCapture.toggle()
+        UserDefaults.standard.set(autoCropScreenCapture, forKey: "autoCropScreenCapture")
+        diagnosticLog.append("自动裁切开关; enabled=\(autoCropScreenCapture)")
+        if videoSource == .screen, let target = selectedScreenTarget {
+            startScreenCapture(target: target)
+        } else { refreshSourceMenu() }
+    }
+
+    func reloadScreenTargets(userInitiated: Bool, completion: (() -> Void)? = nil) {
+        guard !screenTargetsLoading else { return }
+        screenTargetsLoading = true
+        refreshSourceMenu()
+        let excluded = ownWindowNumbers()
+        ScreenCaptureSource.loadTargets(excludingWindowNumbers: excluded) { [weak self] targets, error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.screenTargetsLoading = false
+                self.screenContentAccessConfirmed = error == nil
+                self.screenTargetsError = error?.localizedDescription
+                self.screenTargets = targets
+                self.refreshSourceMenu()
+                if let error {
+                    self.diagnosticLog.append("屏幕来源读取失败; preflight=\(ScreenCaptureSource.hasPermission); error=\(error)")
+                    self.setStatus("无法读取屏幕来源；若权限已开启，请移除旧 SwitchViewer 条目后重新添加此 App", base: false)
+                    completion?()
+                    return
+                }
+                if let spec = self.pendingScreenTargetSpec {
+                    if let target = self.resolveScreenTarget(spec) {
+                        self.diagnosticLog.append("启动参数选择屏幕目标; spec=\(spec); target=\(target.menuTitle)")
+                        // 规格保留到真正启动成功，失败时 retryScreenTargetIfPossible 会重新解析。
+                        self.startScreenCapture(target: target)
+                    } else {
+                        self.diagnosticLog.append("暂时找不到屏幕目标; spec=\(spec)")
+                        self.retryScreenTargetIfPossible()
+                    }
+                }
+                if userInitiated {
+                    self.setStatus("已刷新屏幕来源：\(targets.count) 个可选目标", base: false)
+                }
+                self.diagnosticLog.append("屏幕来源列表已更新; count=\(targets.count)")
+                completion?()
+            }
+        }
+    }
+
+    @objc func selectCaptureCardSource(_ sender: Any) {
+        // Listing devices never starts one; the user must choose a specific device.
+        refreshDevices(selectPreferred: true, startIfSelected: false)
+        deviceMenu.popUp(positioning: nil, at: NSPoint(x: 30, y: rootView.bounds.height - 30), in: rootView)
+    }
+
+    @objc func selectScreenSource(_ sender: NSMenuItem) {
+        guard screenTargets.indices.contains(sender.tag) else { return }
+        startScreenCapture(target: screenTargets[sender.tag])
+    }
+
+    @objc func refreshScreenTargets(_ sender: Any) {
+        reloadScreenTargets(userInitiated: true)
+    }
+
+    @objc func requestScreenPermission(_ sender: Any) {
+        ScreenCaptureSource.requestPermission()
+        reloadScreenTargets(userInitiated: true)
     }
 
     func recordDisplayPresentation(_ frame: PresentationFrame, presentedTime: CFTimeInterval) {
@@ -2648,16 +3437,28 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         if wasPresented, frame.sourceID != nil {
             presentationScheduler.recordSourcePresented(
                 frame.sourceID, contentRootID: frame.sourceContentRootID)
+            screenPresentationScheduler.recordSourcePresented(
+                frame.sourceID, contentRootID: frame.sourceContentRootID)
         }
         if let lead = timing.milliseconds(from: .presentationQueueStarted, to: .gpuCompleted) {
             presentationScheduler.recordRendererLead(lead)
+            screenPresentationScheduler.recordRendererLead(lead)
         }
         displayTimingQueue.async {
             self.displayTimingSamples.append(sample)
+            if wasPresented {
+                self.shownFrameTimes.append(presentedTime)
+                if frame.isInterpolated { self.shownMidpointCount += 1 }
+            }
             let now = ProcessInfo.processInfo.systemUptime
             guard now - self.lastDisplayTimingReportUptime >= 3,
                   !self.displayTimingSamples.isEmpty else { return }
             let samples = self.displayTimingSamples
+            let elapsed = now - self.lastDisplayTimingReportUptime
+            let uniqueShown = Set(self.shownFrameTimes.map { Int64(($0 * 1_000_000).rounded()) }).count
+            self.diagnosticLog.append("实际显示帧率; windowSeconds=\(String(format: "%.2f", elapsed)); displayedFPS=\(String(format: "%.1f", Double(uniqueShown) / max(0.001, elapsed))); shownFrames=\(uniqueShown); shownMidpoints=\(self.shownMidpointCount)")
+            self.shownFrameTimes.removeAll(keepingCapacity: true)
+            self.shownMidpointCount = 0
             self.displayTimingSamples.removeAll(keepingCapacity: true)
             self.lastDisplayTimingReportUptime = now
 
@@ -2726,6 +3527,8 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        // 屏幕捕获接管期间采集卡可能还会投递少量在途帧，直接丢弃。
+        guard videoSource == .captureCard else { return }
         let callbackWorkStart = ProcessInfo.processInfo.systemUptime
         var ptsToCallbackMilliseconds: Double?
         var signatureSamplingMilliseconds: Double?
@@ -2743,6 +3546,22 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
            captureCallbackHostTime >= presentationTimestampHostTime {
             ptsToCallbackMilliseconds = (captureCallbackHostTime - presentationTimestampHostTime) * 1_000
         }
+        signatureSamplingMilliseconds = handleVideoFrame(
+            pixelBuffer: pb,
+            presentationTimeStamp: presentationTimeStamp,
+            captureCallbackHostTime: captureCallbackHostTime,
+            presentationTimestampHostTime: presentationTimestampHostTime)
+    }
+
+    /// Source-agnostic frame entry point shared by the capture card and screen
+    /// capture. Returns the display-signature sampling cost, or nil when
+    /// interpolation is off, so the caller can fold it into its own timing report.
+    @discardableResult
+    func handleVideoFrame(pixelBuffer pb: CVPixelBuffer,
+                          presentationTimeStamp: CMTime,
+                          captureCallbackHostTime: CFTimeInterval,
+                          presentationTimestampHostTime: CFTimeInterval?) -> Double? {
+        var signatureSamplingMilliseconds: Double?
         let pf = CVPixelBufferGetPixelFormatType(pb)
         frameLock.lock()
         let changed = lastWidth != CVPixelBufferGetWidth(pb)
@@ -2756,6 +3575,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         let interpolationEngine = frameInterpolationEngine
         let interpolationMode = frameInterpolationMode
         let pacingMode = presentationPacingMode
+        let contentTimed = videoSource == .screen
         let deadlineCadenceActive = self.deadlineCadenceActive
         let epoch = frameInterpolationEpoch
         frameLock.unlock()
@@ -2763,8 +3583,9 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             diagnosticLog.append("收到视频帧格式变化; buffer=\(CVPixelBufferGetWidth(pb))x\(CVPixelBufferGetHeight(pb)); pixelFormat=\(fourccString(pf))")
             DispatchQueue.main.async {
                 self.updateAppleLowLatencyMenuAvailability()
+                self.applyPendingInterpolationIfNeeded()
                 if self.frameInterpolationMode == .appleLowLatency
-                    || self.frameInterpolationMode == .appleLowLatency4KProxy {
+                    || self.frameInterpolationMode == .appleProxy {
                     self.frameLock.lock()
                     let interpolationEnabled = self.frameInterpolationEnabled
                     let width = self.lastWidth
@@ -2773,11 +3594,11 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                     self.frameLock.unlock()
                     let available = self.frameInterpolationMode == .appleLowLatency
                         ? canUseAppleLowLatencyFrame(width: width, height: height, pixelFormat: pixelFormat)
-                        : canUseAppleLowLatency4KProxy(width: width, height: height, pixelFormat: pixelFormat)
+                        : canUseAppleProxy(width: width, height: height, pixelFormat: pixelFormat)
                     if interpolationEnabled && !available {
                         self.setStatus(self.frameInterpolationMode == .appleLowLatency
                             ? "Apple 原生低延迟插帧只接受 1920×1080 NV12；当前分辨率按原帧显示"
-                            : "Apple 4K 代理插帧只接受 3840×2160 NV12；当前分辨率按原帧显示",
+                            : "Apple 代理插帧至少需要 1024×576 NV12；当前分辨率按原帧显示",
                                        base: false)
                     }
                 }
@@ -2790,17 +3611,25 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             signatureSamplingMilliseconds = (ProcessInfo.processInfo.systemUptime
                                              - signatureStartUptime) * 1_000
         }
+        if interpolationEnabled && contentTimed {
+            frameLock.lock()
+            let content = screenContentDetector.observe(signature: displaySignature,
+                                                        time: CMTimeGetSeconds(presentationTimeStamp))
+            if content.isDuplicate { interpolationRepeatedFrameSkipCount += 1 }
+            frameLock.unlock()
+            if content.isDuplicate { return signatureSamplingMilliseconds }
+        }
         if interpolationEnabled,
-           interpolationMode == .appleLowLatency4KProxy,
-           pacingMode == .deadlineScheduled,
-           deadlineCadenceActive,
+           (contentTimed || (interpolationMode == .appleProxy &&
+                            pacingMode == .deadlineScheduled && deadlineCadenceActive)),
            let interpolationEngine,
            let presentationTimestampHostTime {
             frameLock.lock()
             nextSourceFrameID &+= 1
             let sourceID = nextSourceFrameID
             frameLock.unlock()
-            presentationScheduler.offerSource(CapturedSourceFrame(
+            let scheduler = contentTimed ? screenPresentationScheduler : presentationScheduler
+            scheduler.offerSource(CapturedSourceFrame(
                 id: sourceID,
                 pixelBuffer: pb,
                 signature: displaySignature,
@@ -2811,7 +3640,8 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             let interpolationSubmittedHostTime = presentationHostTimeNow()
             interpolationEngine.submit(pb,
                                        presentationTimeStamp: presentationTimeStamp,
-                                       displaySignature: displaySignature) {
+                                       displaySignature: displaySignature,
+                                       contentTimed: contentTimed) {
                 [weak self] generated, error, halfInterval in
                 guard let self else { return }
                 if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
@@ -2832,10 +3662,11 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                     midpointPresentationTimeStamp,
                     CMTime(seconds: halfInterval, preferredTimescale: 60_000))
                 let readyHostTime = presentationHostTimeNow()
-                self.presentationScheduler.offerMidpoint(InterpolatedFrame(
+                scheduler.offerMidpoint(InterpolatedFrame(
                     previousSourcePresentationTimeStamp: previousSourcePresentationTimeStamp,
                     currentSourceID: sourceID,
                     pixelBuffer: generated,
+                    sourceAspect: Self.aspectRatio(of: pb),
                     mediaPresentationTimeStamp: midpointPresentationTimeStamp,
                     mediaHostTime: midpointHostTime,
                     captureCallbackHostTime: captureCallbackHostTime,
@@ -2846,7 +3677,8 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         } else if interpolationEnabled, let interpolationEngine {
             interpolationEngine.submit(pb,
                                        presentationTimeStamp: presentationTimeStamp,
-                                       displaySignature: displaySignature) {
+                                       displaySignature: displaySignature,
+                                       contentTimed: false) {
                 [weak self] generated, error, halfInterval in
                 guard let self else { return }
                 if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
@@ -2868,6 +3700,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                                     captureCallbackHostTime: captureCallbackHostTime))
             ], epoch: epoch, requireInterpolation: false)
         }
+        return signatureSamplingMilliseconds
     }
 
     func enqueueInterpolatedFrames(generated: CVPixelBuffer?, source: CVPixelBuffer,
@@ -2896,6 +3729,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                 isInterpolated: true,
                 minimumPresentationDuration: minimumPresentationDuration,
                 presentationTimestampHostTime: hostTime(forCaptureTimestamp: generatedPresentationTimeStamp),
+                referenceAspect: Self.aspectRatio(of: source),
                 timing: PresentationFrameTiming(
                     captureCallbackHostTime: captureCallbackHostTime,
                     processingReadyHostTime: processingReadyHostTime)))
@@ -2910,6 +3744,13 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                                             captureCallbackHostTime: captureCallbackHostTime,
                                             processingReadyHostTime: processingReadyHostTime)))
         enqueuePresentationFrames(frames, epoch: epoch, requireInterpolation: true)
+    }
+
+    /// 显示时使用的宽高比。插值帧必须沿用其源帧的，否则代理的非等比缩放会露出来。
+    static func aspectRatio(of buffer: CVPixelBuffer) -> Float {
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        return Float(width) / Float(max(1, height))
     }
 
     func enqueuePresentationFrames(_ frames: [PresentationFrame],
@@ -2985,6 +3826,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         defer { frameLock.unlock() }
         return frameInterpolationEpoch == epoch
             && (!requireInterpolation || frameInterpolationEnabled)
+            && !screenOutputSuspended
     }
 
     func recordInterpolationFailure(_ message: String) {
@@ -3005,6 +3847,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         if shouldLog { diagnosticLog.append("插帧失败; error=\(message)") }
         if shouldDisable {
             presentationScheduler.reset(epoch: epoch)
+            resetScreenTiming(epoch: epoch)
             interpolationEngine?.reset()
             DispatchQueue.main.async {
                 self.frameInterpolationMenuItem?.state = .off
@@ -3038,7 +3881,13 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             onPresented()
             return
         }
+        frameLock.lock()
+        let softenSource = uniformProxyFrames && frameInterpolationEnabled
+            && frameInterpolationMode == .appleProxy && !frame.isInterpolated
+        frameLock.unlock()
         let (ok, err) = r.render(pixelBuffer: frame.pixelBuffer,
+                                 referenceAspect: frame.referenceAspect,
+                                 softenSource: softenSource,
                                  minimumPresentationDuration: frame.minimumPresentationDuration,
                                  targetPresentationHostTime: frame.targetPresentationHostTime,
                                  onPresented: { [weak self] presentedTime in

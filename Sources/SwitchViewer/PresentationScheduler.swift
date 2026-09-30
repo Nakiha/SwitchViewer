@@ -17,6 +17,8 @@ struct InterpolatedFrame {
     let previousSourcePresentationTimeStamp: CMTime
     let currentSourceID: UInt64
     let pixelBuffer: CVPixelBuffer
+    /// 该中间帧所属源帧的宽高比；代理是非等比缩放，显示时必须沿用它。
+    let sourceAspect: Float?
     let mediaPresentationTimeStamp: CMTime
     let mediaHostTime: CFTimeInterval
     let captureCallbackHostTime: CFTimeInterval
@@ -62,7 +64,10 @@ final class PresentationScheduler {
     private var signatureCompareTimeSamples: [Double] = []
     // Start close to the measured end-to-end readiness budget. The estimator can
     // raise this when real midpoint completion requires more headroom.
-    private let initialPlayoutDelayMilliseconds = 75.0
+    private let initialPlayoutDelayMilliseconds: Double
+    private let contentTimed: Bool
+    private var lastEmittedMediaTime = -Double.infinity
+    private var staleFrameDropCount = 0
     private var playoutDelayMilliseconds = 75.0
     private var lastDelayDecreaseUptime = ProcessInfo.processInfo.systemUptime
     private var lastReportUptime = ProcessInfo.processInfo.systemUptime
@@ -75,8 +80,12 @@ final class PresentationScheduler {
     private var signatureCompareCount = 0
     private var signatureDuplicateCount = 0
 
-    init(onFrame: @escaping (PresentationFrame, Int) -> Void,
+    init(contentTimed: Bool = false,
+         onFrame: @escaping (PresentationFrame, Int) -> Void,
          onReport: @escaping (String) -> Void) {
+        self.contentTimed = contentTimed
+        self.initialPlayoutDelayMilliseconds = contentTimed ? 50 : 75
+        self.playoutDelayMilliseconds = self.initialPlayoutDelayMilliseconds
         self.onFrame = onFrame
         self.onReport = onReport
     }
@@ -89,6 +98,8 @@ final class PresentationScheduler {
             self.latestSourceContentRootID = nil
             self.lastPresentedSourceContentRootID = nil
             self.epoch = epoch
+            self.lastEmittedMediaTime = -Double.infinity
+            self.staleFrameDropCount = 0
             if !preservingLearnedTiming {
                 self.requiredDelaySamples.removeAll(keepingCapacity: true)
                 self.renderLeadSamples.removeAll(keepingCapacity: true)
@@ -112,6 +123,10 @@ final class PresentationScheduler {
     func offerSource(_ frame: CapturedSourceFrame) {
         queue.async {
             guard frame.epoch == self.epoch else { return }
+            if self.contentTimed, frame.mediaHostTime <= self.lastEmittedMediaTime {
+                self.staleFrameDropCount += 1
+                return
+            }
             let previous = self.latestSource
             var isDuplicate = false
             if let previousSignature = previous?.signature,
@@ -126,6 +141,10 @@ final class PresentationScheduler {
                         self.signatureCompareTimeSamples.count - 180)
                 }
                 if isDuplicate { self.signatureDuplicateCount += 1 }
+            }
+            if self.contentTimed && isDuplicate {
+                self.reportIfNeeded()
+                return
             }
             let contentRootID = isDuplicate
                 ? (self.latestSourceContentRootID ?? frame.id)
@@ -160,6 +179,10 @@ final class PresentationScheduler {
     func offerMidpoint(_ frame: InterpolatedFrame) {
         queue.async {
             guard frame.epoch == self.epoch else { return }
+            if self.contentTimed, frame.mediaHostTime <= self.lastEmittedMediaTime {
+                self.staleFrameDropCount += 1
+                return
+            }
             self.observeRequiredDelay(frame)
             let slot = self.slot(for: frame.mediaHostTime)
             let now = Self.hostTimeNow
@@ -232,7 +255,7 @@ final class PresentationScheduler {
         guard requiredDelaySamples.count >= 60,
               let p99 = Self.percentile(requiredDelaySamples, 0.99) else { return }
         if p99 > playoutDelayMilliseconds {
-            playoutDelayMilliseconds = p99
+            playoutDelayMilliseconds = contentTimed ? min(100, p99) : p99
             lastDelayDecreaseUptime = now
             retimePendingSlots()
         } else if p99 < playoutDelayMilliseconds,
@@ -275,7 +298,8 @@ final class PresentationScheduler {
         slot.wakeDeadlineHostTime = slot.renderDeadlineHostTime - safety
         let delay = max(0, slot.wakeDeadlineHostTime - Self.hostTimeNow)
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + delay, leeway: .milliseconds(1))
+        timer.schedule(deadline: .now() + delay,
+                       leeway: contentTimed ? .microseconds(250) : .milliseconds(1))
         timer.setEventHandler { [weak self, weak slot] in
             guard let self, let slot else { return }
             self.fire(slot)
@@ -296,7 +320,8 @@ final class PresentationScheduler {
             schedulerWakeLatenessSamples.removeFirst(
                 schedulerWakeLatenessSamples.count - 180)
         }
-        let deadlineMissed = now > slot.renderDeadlineHostTime
+        let deadlineMissed = now > (contentTimed
+            ? slot.targetHostTime - 0.001 : slot.renderDeadlineHostTime)
 
         let selected: PresentationFrame?
         if let source = slot.source, !slot.sourceIsDuplicate {
@@ -322,7 +347,14 @@ final class PresentationScheduler {
             heldSlotCount += 1
             selected = nil
         }
-        if let selected { onFrame(selected, epoch) }
+        if let selected {
+            if contentTimed && slot.mediaHostTime <= lastEmittedMediaTime {
+                staleFrameDropCount += 1
+            } else {
+                lastEmittedMediaTime = slot.mediaHostTime
+                onFrame(selected, epoch)
+            }
+        }
         reportIfNeeded()
     }
 
@@ -350,6 +382,7 @@ final class PresentationScheduler {
                           presentationTimestampHostTime: midpoint.mediaHostTime,
                           targetPresentationHostTime: target,
                           sourceID: nil,
+                          referenceAspect: midpoint.sourceAspect,
                           timing: PresentationFrameTiming(
                             captureCallbackHostTime: captureCallbackHostTime,
                             processingReadyHostTime: midpoint.readyHostTime))
@@ -366,6 +399,9 @@ final class PresentationScheduler {
         let compareP50 = Self.percentile(signatureCompareTimeSamples, 0.50)
         let compareP95 = Self.percentile(signatureCompareTimeSamples, 0.95)
         let compareP99 = Self.percentile(signatureCompareTimeSamples, 0.99)
+        if contentTimed {
+            onReport("屏幕内容定时; sourceUpdates=\(sourceSlotCount); midpointOffers=\(midpointSlotCount); lateMidpointDrops=\(lateMidpointDropCount); staleFrameDrops=\(staleFrameDropCount); delayMs=\(String(format: "%.1f", playoutDelayMilliseconds))")
+        }
         onReport("deadline scheduler; sourceOffers=\(sourceSlotCount) midpointOffers=\(midpointSlotCount) heldSlots=\(heldSlotCount); lateMidpointDrops=\(lateMidpointDropCount); midpointLateByP50P95P99Ms=\(lateP50.map { String(format: "%.1f", $0) } ?? "无")/\(lateP95.map { String(format: "%.1f", $0) } ?? "无")/\(lateP99.map { String(format: "%.1f", $0) } ?? "无"); sourceFallbacks=\(sourceFallbackCount); midpointSupersededBySource=\(midpointSupersededBySourceCount); signatureCompare=\(signatureCompareCount); signatureDuplicate=\(signatureDuplicateCount); signatureCompareP50P95P99Ms=\(compareP50.map { String(format: "%.3f", $0) } ?? "无")/\(compareP95.map { String(format: "%.3f", $0) } ?? "无")/\(compareP99.map { String(format: "%.3f", $0) } ?? "无"); playoutDelayP99Ms=\(String(format: "%.1f", playoutDelayMilliseconds)); renderLeadP99Ms=\(String(format: "%.1f", renderLeadP99Milliseconds)); schedulerWakeLatenessP99Ms=\(wakeP99.map { String(format: "%.2f", $0) } ?? "无"); deadlineSafetyMs=\(String(format: "%.2f", deadlineSafetyMilliseconds))")
         sourceSlotCount = 0
         midpointSlotCount = 0
@@ -375,6 +411,7 @@ final class PresentationScheduler {
         midpointSupersededBySourceCount = 0
         signatureCompareCount = 0
         signatureDuplicateCount = 0
+        staleFrameDropCount = 0
         signatureCompareTimeSamples.removeAll(keepingCapacity: true)
         midpointLateBySamples.removeAll(keepingCapacity: true)
     }

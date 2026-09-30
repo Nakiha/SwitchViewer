@@ -3,3 +3,6 @@
 SwitchViewer.app/
 Artifacts/SwitchViewer-pre-*
 Artifacts/*.app/
+Artifacts/color-*/
+Artifacts/user-color-comparison/
+Artifacts/ui-interpolation-check/

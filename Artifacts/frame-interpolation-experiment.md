@@ -245,3 +245,33 @@
 - 单改回“按检测节奏限速”不能避开该调用：旧节奏和 deadline 节奏共用 4K 代理插帧器；之前的异步实现也走同一个 `process(with:parameters:)` selector。为避开已知崩溃入口，代理缩放 command buffer 先完成，再调用 VideoToolbox 的独立异步 completion-handler 接口；另加非递增、无效或间隔大于等于 1 秒的时间戳检查，遇到时跳过插值并记录 PTS。
 - v2 长跑日志还显示 cadence unknown/30fps 反复切换，在约 2.5 分钟内发生 5 次 scheduler reset，含 4 秒内 3 次的簇。unknown 宽限增至 60 个采集样本，并要求连续 8 帧识别为 30fps 才重新启用 scheduler。
 - `swift build -c release` 成功；只见现有 AVFoundation 与 FrameInterpolationLab 的弃用警告。独立 v3 app `.build/SwitchViewer-Deadline-Experiment-v3.app` 已通过 strict signature 校验。当前未连接实机长跑验证；接下来重点观察崩溃是否消失、`separateProcessorSubmission` 耗时与 cadence reset 频率。
+
+## 2026-09-30：屏幕捕获来源（ScreenCaptureKit）与通用代理插帧
+
+- 菜单新增“画面来源”，可在采集卡与屏幕捕获之间切换；屏幕捕获可选任意显示器或单个窗口。窗口捕获用 `SCContentFilter(desktopIndependentWindow:)`（被遮挡也能抓）；显示器捕获会排除 SwitchViewer 自己的窗口，避免把预览画面抓回去形成回环。新增 `Sources/SwitchViewer/ScreenCaptureSource.swift`。
+- 帧入口重构：原属 `AVCaptureVideoDataOutput` 的 `captureOutput` 主体拆成与来源无关的 `handleVideoFrame(pixelBuffer:presentationTimeStamp:captureCallbackHostTime:presentationTimestampHostTime:)`，采集卡与屏幕捕获共用同一条节奏检测→插帧→呈现链路。`hostTime(forCaptureTimestamp:)` 按来源分支：采集卡走 `session.synchronizationClock`，屏幕捕获直接用 host clock（实测 ScreenCaptureKit 的 PTS 本身就在 host 时钟域，回调时 age 约 0.4ms）。
+- `ScreenCaptureSource` 请求 `420v` NV12、`queueDepth=3`、`minimumFrameInterval=1/60`。独立测试程序实测：显示器捕获稳定输出 3024×1964 420v 且带 IOSurface，窗口捕获 1360×1058，两者都是约 60Hz 回调栅格、PTS 单调递增，判定 PASS。
+- 为保持与采集卡一致的“固定栅格 + 重复帧”契约，窗口捕获里 `SCFrameStatusIdle`（内容未变化、不带像素缓冲）的 tick 会用上一张缓冲重放，因此既有的 `SwitchFrameCadenceDetector` 不需要改动。显示器捕获不产生 idle tick，重复帧仍由像素签名比较识别，与采集卡相同。
+- `AppleDownsampledFrameInterpolator` 从写死 4K 输入改为接受任意输入：在 1080p→720p→576p 中取“不超过输入尺寸的最大档位”作为代理；输入本身已是受支持档位时不再缩放，直接交给 VideoToolbox。离线验证（本机 M5）：3840×2160→1920×1080 缩放 16.4ms、3024×1964→1920×1080 缩放 17.5ms、1360×1058→1280×720 缩放 7.7ms、1280×720 原样直通 4.4ms、1024×576 原样直通 2.6ms、640×360 在初始化阶段即以明确错误拒绝。4K 采集卡路径行为与改动前一致。
+- 新增 `AppleLowLatencyProxySize`，把“Apple 低延迟插帧实际只接受 576p/720p/1080p”这一实测结论固化进代码：文档给的 `maximumDimension`/`maximumPixelCount`（本机 1920 与 2073600）只是必要条件，1600×900、1440×1080 等满足文档条件仍会在 process 阶段报 `VTFrameProcessorProcessingError (-19740)`。插帧方式菜单里的“4K代理”更名为“代理缩放”，同一项现在同时适用于采集卡与屏幕捕获。
+- 帧代次管理统一为 `beginNewSourceGeneration(reason:)`，采集卡会话与屏幕捕获互相切换时都会推进 epoch 并重置统计，避免旧来源的帧在新来源下上屏；任何采集卡菜单操作都隐含切回采集卡。
+- `swift build -c release --disable-sandbox` 通过（只剩既有的 `AVCaptureDevice.devices(for:)` 弃用警告）。`SwitchViewer.app` 已更新并通过严格签名校验，替换前的二进制保存在 `Artifacts/SwitchViewer-pre-screen-source-20260930`。启动日志新增 `屏幕捕获权限; granted=…` 与 `开始新的画面来源代次; …`，已确认新版能正常启动。
+- 边界与未验证项：SwitchViewer 自身尚未获得“屏幕录制”权限，来源菜单会显示“申请屏幕录制权限…”；授权后需重新打开 app，且因为是 ad-hoc 签名，重新构建改变签名哈希后可能要再次授权。本次只验证到“ScreenCaptureSource 能拿到正确的 420v/IOSurface 缓冲”和“代理插帧在任意输入尺寸下的行为”，菜单切到屏幕捕获后的端到端观感、延迟与长时间稳定性尚未实机确认。
+
+## 2026-09-30：屏幕捕获插帧联调，查出缓冲池耗尽缺陷
+
+- 目标：在真实来源上跑通“屏幕捕获 → 下采样 → Apple 插帧 → 上采样”。被测目标是《鸣潮》（Unity，`com.kurogame.mingchao`），同时用合成 30Hz 窗口与桌面做对照。
+- **缺陷（已修）**：`SCStreamConfiguration.queueDepth` 原设 3，而插帧链路会同时持有约 9 张源帧——节奏检测 `recentCaptureFrames` 3 张、待处理队列最多 2 张、`latestSubmission` 1 张、正在插值的 previous/current 2 张、屏幕来源 `lastPixelBuffer` 1 张。ScreenCaptureKit 的缓冲池因此被耗尽，表现为**投递 4 帧后彻底静默、且不报任何错误**：`screenDelivered=4`、`SCStreamDelegate.didStopWithError` 不触发、`lastFrame` 冻结、`sample` 里没有任何线程阻塞在锁或信号量上。只在开启插帧时复现；同一路显示器捕获关闭插帧时稳定 57.5fps、852 帧。队列深度改为 12 后连续 75 秒稳定：`screenDelivered=3407`、`frames=4933`、`interpolatedFrames=1539`、`interpolationFailures=0`、`renderError=无`、`lastFrame=0.0s`。
+- 排查过程中值得记住的一点：独立进程里 `AppleDownsampledFrameInterpolator` 在 3024×1964 上连续 150 次提交，P50 13.0ms、P95 15.3ms、无停顿，所以插帧器本身没问题；只有在 app 内把来源计数打出来之后，才定位到回调在源头就停止了。
+- 稳态性能（3024×1964 显示器捕获 → 1920×1080 代理，桌面静态场景）：`provider` 与 `interpolationSubmitToReady` 同为 P50/P95 12.4/17.3ms；`proxyEncodeCPU` 0.2/0.3ms、`commandBufferGPU` 1.2/5.9ms；`proxyCache` 约 50% 命中（173/173）。采集侧 `ptsToCallback` 仅 0.1/0.3ms、`signatureSampling` 0.3/2.7ms、`callbackWork` 0.3/2.8ms。上屏：插值帧 callback→display 37.1/43.6ms、采集帧 43.0/53.1ms，其中 `gpuCompleteToDisplay` 20.5–26.8ms 是最大单项。与采集卡 4K 代理路径相比，屏幕捕获省掉了采集卡自身的交付延迟（`ptsToCallback` 从约 28ms 量级降到 0.1–0.3ms），但上屏段仍是大头。
+- **真实游戏的阻塞点**：《鸣潮》全屏后会进入自己的 Space。`SCShareableContent` 的 on-screen 过滤看不到它，把列举与启动都改成 `onScreenWindowsOnly: false` 之后才能列出该窗口；但即便如此，ScreenCaptureKit 也投递 0 个缓冲——游戏在非前台 Space 时不再绘制，没有画面可插。独立探针复核：窗口列举正常、`capturedSize=3024×1898`、6 秒内 `buffers delivered: 0`。结论：在 macOS 上要对游戏做这条链路，游戏必须处于可见状态（窗口/无边框模式）；全屏独占 Space 不可用，即便能捕获到也无法把预览窗盖到那个 Space 上。
+- 顺带修复的可用性问题：`app:` 目标原先是对“应用名 — 标题”整串匹配，`app:鸣潮` 会命中标题含“鸣潮”的 Safari 窗口；现在 `app:` 只匹配应用名、`title:` 只匹配标题，多个同尺寸窗口取面积最大者，失败过的窗口 ID 会被排除后重试（游戏启动期的临时窗口会在列举与启动之间失效，且列举与启动必须使用同一组 `onScreenWindowsOnly` 参数，否则目标永远找不到）。
+- 顺带补齐的诊断：`ScreenCaptureSource.SourceError` 与 `AppleDownsampledFrameInterpolator.InterpolationError` 之前只实现 `CustomStringConvertible`，日志里只会打印“错误4”这类无意义文本，已同时实现 `LocalizedError`；定时状态新增 `source=`、`screenDelivered/screenReplayed/screenEmptyCallback`；屏幕来源的 `didStopWithError` 现在也写入诊断日志（此前只更新状态栏，“流静默停止”完全不可见）。
+- 新增可自动化入口：`--screen-target=display:first|display:<id>|app:<名称>|title:<标题>`、`--enable-interpolation`、`--interpolation-mode=<值>`、`--request-screen-permission`、`--click-through`，以及 `SWITCHVIEWER_LOG_DIR` 覆盖日志目录。窗口菜单新增“鼠标穿透（盖在游戏上时开启）”，开启时自动置顶——没有它预览窗会吞掉游戏的鼠标输入。
+- 未验证：真实游戏画面（30fps 内容）下的节奏识别与插帧画质。本次受限于游戏无法在可见状态下运行，只验证了静态桌面场景下的全链路正确性与性能。
+
+### 后续验证与修正（2026-09-30）
+
+- 上述“全屏独占 Space 不可用”是早期非前台 Space 测试的结论，不能作为 ScreenCaptureKit 的普遍限制。后续通过不获取焦点的游戏操作浮窗，保持游戏为前台应用，已验证游戏捕获与显示；游戏未绘制时仍不能生成新的源画面。
+- 屏幕来源现按独立内容更新时间戳配对和定时显示，不再使用采集卡的固定重复周期识别。测试范围及计数定义见 `screen-content-timing.md`。
+- 默认屏幕捕获在当前广色域显示器上出现颜色变淡；串行单帧对比中，仅明确指定捕获色彩空间为 sRGB 就明显纠正静态头像的色度偏差。捕获输出与 Metal 显示层现均明确使用 sRGB。先前使用明确 sRGB 转换的 RGB 离线模拟未覆盖该默认捕获行为。

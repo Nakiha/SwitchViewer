@@ -13,6 +13,7 @@ let package = Package(
         .executableTarget(
             name: "FrameInterpolationLab",
             dependencies: ["SwitchViewerInterpolation"]
-        )
+        ),
+        .testTarget(name: "SwitchViewerInterpolationTests", dependencies: ["SwitchViewerInterpolation"])
     ]
 )

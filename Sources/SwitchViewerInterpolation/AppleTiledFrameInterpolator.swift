@@ -156,7 +156,7 @@ public final class AppleTiledFrameInterpolator {
     }
 
     deinit {
-        processors.forEach { $0.endSession() }
+        FrameProcessorSessionCleanup.end(processors)
     }
 
     /// Synthesizes one midpoint frame from two full-size NV12 frames.
