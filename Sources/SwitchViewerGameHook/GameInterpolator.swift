@@ -979,4 +979,3 @@ final class GameInterpolator {
         frameTrace.record(event)
     }
 }
-
