@@ -36,6 +36,10 @@ jobs:
             exit 1
           fi
       - name: Swift regression tests
+        env:
+          # Hosted VM returns VTFrameProcessorErrorDomain -19740 despite
+          # isSupported=true. These two real-device tests still run locally.
+          SWITCHVIEWER_TEST_APPLE_INTERPOLATION: '0'
         run: swift test
       - name: Diagnostic analysis tests
         run: python3 -m unittest discover -s Tests -p 'test_*.py'

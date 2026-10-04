@@ -39,6 +39,7 @@ final class GameFrameColorTests: XCTestCase {
 
     @available(macOS 26.0, *)
     func testAppleIdenticalFrameDoesNotChangeEncodedGray() throws {
+        try HardwareTestSupport.requireAppleInterpolation()
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
         let converter = try GameFrameColorConverter(device: device)
         let width = 1920, height = 1080

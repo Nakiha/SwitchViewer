@@ -1,15 +1,12 @@
 import CoreMedia
 import CoreVideo
 import XCTest
-import VideoToolbox
 @testable import SwitchViewerInterpolation
 
 final class FrameProcessorLifecycleTests: XCTestCase {
     func testReleaseDuringInFlightProxyProcessing() throws {
         guard #available(macOS 26.0, *) else { throw XCTSkip("Requires VideoToolbox frame processing") }
-        guard VTLowLatencyFrameInterpolationConfiguration.isSupported else {
-            throw XCTSkip("Apple interpolation is unavailable on this machine")
-        }
+        try HardwareTestSupport.requireAppleInterpolation()
         // Reproduce switching interpolation off while VideoToolbox owns the final
         // reference through its completion block. Destruction runs on its queue.
         for iteration in 0..<10 {

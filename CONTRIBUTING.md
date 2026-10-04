@@ -12,7 +12,7 @@ Scripts/build-ipad-app.sh simulator
 
 修改 macOS 界面、来源切换或启动器时，另在本机桌面执行 `Scripts/check-ui-workflow.sh`。修改 Metal hook 时使用测试窗口验证 command buffer 和直接 drawable 呈现，确认退出、尺寸变化与原画面回退。实际游戏启动属于设备验收，不是贡献者提交代码的必需条件。
 
-GitHub CI 使用 `xcode-27` 预览镜像。没有 Metal 或 Apple 插帧能力的机器会明确跳过相应硬件测试，跳过不等于硬件验证通过；桌面交互、采集卡热插拔和真机性能仍需本机检查。
+GitHub CI 使用 `xcode-27` 预览镜像。当前云端虚拟机声明支持 Apple 插帧，但实际处理返回 `VTFrameProcessorErrorDomain -19740`，因此 CI 显式设置 `SWITCHVIEWER_TEST_APPLE_INTERPOLATION=0`，跳过生命周期与 Apple 静态灰阶两项实机测试；其余测试和 Metal RGB 色彩往返仍运行。没有 Metal 的机器另按能力检查跳过对应测试。跳过不等于硬件验证通过；本机默认不设置该变量，必须运行这两项测试。桌面交互、采集卡热插拔和真机性能仍需本机检查。
 
 新游戏接入请新增 [游戏插件](Docs/game-plugins.md)，不要把游戏安装路径、商店链接或识别逻辑写进通用捕获与呈现代码。保持修改目的明确，并补充能捕获实际回归的测试。
 
