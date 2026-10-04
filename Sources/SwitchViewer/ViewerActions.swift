@@ -194,6 +194,7 @@ extension AppDelegate {
     }
 
     @objc func toggleFrameInterpolation(_ sender: Any) {
+        comparisonRecorder.stop()
         guard fallbackLayer == nil else {
             setStatus("插帧需要 Metal 渲染；当前正在使用系统预览", base: false)
             return

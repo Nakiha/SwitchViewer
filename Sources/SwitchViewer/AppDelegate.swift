@@ -7,8 +7,21 @@ import Metal
 import VideoToolbox
 import simd
 import SwitchViewerInterpolation
+import SwitchViewerRecording
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    var waitingForRecordingTermination = false
+    var comparisonRecordingStatus = ""
+    var comparisonRecordingDirectory: URL?
+    lazy var comparisonRecorder = ComparisonMovieRecorder { [weak self] event in
+        DispatchQueue.main.async { self?.receiveComparisonRecordingEvent(event) }
+    }
+
+    override init() {
+        super.init()
+        _ = comparisonRecorder // Initialize on main before capture callbacks can run.
+    }
+
     struct DisplayLatencySample {
         let isInterpolated: Bool
         let callbackToDisplayMilliseconds: Double?
@@ -253,6 +266,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { [weak self] _ in
             self?.logPeriodicDiagnostics()
         }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard comparisonRecorder.isBusy else { return .terminateNow }
+        waitingForRecordingTermination = true
+        comparisonRecorder.stop()
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {

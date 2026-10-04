@@ -281,6 +281,36 @@ struct WorkflowCheck {
         expect(workflowTitle.stringValue == "游戏插帧 · 插帧测试窗口", "game runtime moves the game name into the toolbar title")
         validateLayout()
         checkCompactMetricsLayout()
+        checkGameMovieRecording { pauseGameAfterRecording() }
+    }
+    static func checkGameMovieRecording(_ completion: @escaping () -> Void) {
+        expect(owner.gameInjectionController.canRecordComparison, "fixture acknowledges paired movie recording control")
+        owner.gameInjectionController.toggleComparisonRecording()
+        later(2) {
+            expect(owner.gameInjectionController.isComparisonRecording, "game confirms paired recording began")
+            expect(!owner.gameInjectionController.canRecordComparison, "another recording cannot start during a session")
+            owner.gameInjectionController.toggleComparisonRecording()
+            waitForGameMovieSave(remaining: 20, completion)
+        }
+    }
+    static func waitForGameMovieSave(remaining: Int, _ completion: @escaping () -> Void) {
+        later(0.5) {
+            if owner.gameInjectionController.comparisonRecordingBusy && remaining > 0 {
+                waitForGameMovieSave(remaining: remaining - 1, completion); return
+            }
+            expect(owner.gameInjectionController.comparisonRecordingStatus == "两路素材已保存", "paired game recording finishes both movies")
+            let folder = owner.gameInjectionController.comparisonRecordingDirectory!
+            let data = try! Data(contentsOf: folder.appendingPathComponent("recording.json"))
+            let json = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
+            let tracks = json["tracks"] as! [String: [String: Int]]
+            expect(json["state"] as? String == "completed" && tracks["original"]!["frames"]! > 0
+                && tracks["processed"]!["generatedFrames"]! > 0, "saved movie pair contains source and confirmed generated frames")
+            expect(["original.mov", "processed.mov"].allSatisfy { FileManager.default.fileExists(atPath: folder.appendingPathComponent($0).path) }, "both comparison movie files exist")
+            try? FileManager.default.removeItem(at: folder)
+            completion()
+        }
+    }
+    static func pauseGameAfterRecording() {
         let toggle = button("开启插帧")
         toggle.state = .off
         toggle.sendAction(toggle.action!, to: toggle.target)

@@ -1,6 +1,7 @@
 import AppKit
 import SwitchViewerInterpolation
 import SwitchViewerGamePlugins
+import SwitchViewerRecording
 
 /// Launch-time injection only: this controller never edits or re-signs the target.
 final class GameInjectionController: NSObject, NSWindowDelegate {
@@ -28,8 +29,62 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private(set) var interpolationControlStatus = ""
     var canToggleGameInterpolation: Bool { isGameRunning && supportsInterpolationControl && !interpolationRequestPending }
 
+    private var supportsMovieControl = false
+    private var movieRequest: DispatchWorkItem?
+    private(set) var isComparisonRecording = false
+    private(set) var comparisonRecordingBusy = false
+    private(set) var comparisonRecordingStatus = ""
+    private(set) var comparisonRecordingDirectory: URL?
+    var canRecordComparison: Bool {
+        isGameRunning && supportsMovieControl && isGameInterpolationEnabled && !comparisonRecordingBusy
+    }
+    func toggleComparisonRecording() {
+        guard let process else { return }
+        if isComparisonRecording {
+            isComparisonRecording = false
+            comparisonRecordingStatus = "正在保存…"
+            GameMovieRecordingControl.request(processID: process.processIdentifier, start: false)
+            return
+        }
+        guard canRecordComparison else { return }
+        comparisonRecordingBusy = true
+        comparisonRecordingStatus = "等待游戏开始录制…"
+        GameMovieRecordingControl.request(processID: process.processIdentifier, start: true)
+        let request = DispatchWorkItem { [weak self] in
+            guard let self, !self.isComparisonRecording else { return }
+            self.comparisonRecordingStatus = "游戏未响应录制请求，请重启游戏后重试"
+            self.comparisonRecordingBusy = false
+            // A late begin acknowledgement restores the actual recording state.
+        }
+        movieRequest = request
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: request)
+    }
+    private func consumeMovieRecord(_ line: String) {
+        func decoded(_ key: String) -> String? {
+            guard let field = line.split(separator: " ").first(where: { $0.hasPrefix(key + "=") }),
+                  let data = Data(base64Encoded: String(field.dropFirst(key.count + 1))) else { return nil }
+            return String(data: data, encoding: .utf8)
+        }
+        movieRequest?.cancel()
+        if line.contains("MOVIE_RECORD begin") {
+            isComparisonRecording = true
+            comparisonRecordingBusy = true
+            comparisonRecordingStatus = "正在录制两路素材 · 最长 30 秒"
+        } else if line.contains("MOVIE_RECORD finishing") {
+            isComparisonRecording = false
+            comparisonRecordingStatus = "正在保存…"
+        } else {
+            isComparisonRecording = false
+            comparisonRecordingBusy = false
+            comparisonRecordingStatus = line.contains("MOVIE_RECORD end") ? "两路素材已保存"
+                : "录制失败：" + (decoded("detail") ?? "未知原因")
+        }
+        if let path = decoded("path") { comparisonRecordingDirectory = URL(fileURLWithPath: path) }
+        toolbar?.refreshConfiguration()
+    }
+
     func toggleGameInterpolation() {
-        guard canToggleGameInterpolation, let process else { return }
+        guard !comparisonRecordingBusy, canToggleGameInterpolation, let process else { return }
         interpolationRequestPending = true
         interpolationControlStatus = "等待游戏确认…"
         GameInterpolationControl.request(processID: process.processIdentifier)
@@ -142,6 +197,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
 
     func showSettings() { show(); toolbar?.showTab(0) }
     func synchronizeWorkflow() { toolbar?.synchronizeWorkflow() }
+    func refreshConfiguration() { toolbar?.refreshConfiguration() }
 
     func receiveScreenMetrics(_ metrics: PerformanceMetrics) {
         guard process == nil else { return }
@@ -214,6 +270,10 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         environment["SWITCHVIEWER_GAME_PROFILE"] = interpolationProfile.rawValue
         environment["SWITCHVIEWER_GAME_DISPLAY_SYNC"] = displaySyncEnabled ? "1" : "0"
         environment["SWITCHVIEWER_GAME_CADENCE"] = presentationCadence.rawValue
+        if executable.lastPathComponent == "GameHookFixture" {
+            environment["SWITCHVIEWER_COMPARISON_RECORDING_ROOT"] = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(".build/workflow-movies").path
+        }
         child.environment = environment
         let logDirectory = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Logs/SwitchViewer/GameInjection", isDirectory: true)
@@ -287,10 +347,13 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
                 supportsInterpolationControl = line.contains("interpolationControl=darwin-v1")
                 confirmInterpolation(enabled: true)
                 interpolationControlStatus = supportsInterpolationControl ? "" : "重启游戏以启用面板开关；当前可按 ⌥⇧I"
+                supportsMovieControl = line.contains("movieControl=darwin-v1")
+                comparisonRecordingStatus = supportsMovieControl ? "" : "重启游戏以加载素材录制入口"
                 supportsTraceControl = line.contains("traceControl=darwin-v1")
                 frameTraceStatus = supportsTraceControl ? "" : "重启游戏以加载记录入口"
                 update("插帧库已加载，等待 Metal 游戏画面…")
             }
+            else if line.contains("MOVIE_RECORD ") { consumeMovieRecord(String(line)) }
             else if line.contains("FRAME_TRACE begin") {
                 traceRequest?.cancel()
                 traceRequestPending = false
@@ -340,6 +403,11 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         toolbar?.refreshConfiguration()
         onReport("游戏内插帧; \(message)") }
     private func finish() {
+        movieRequest?.cancel()
+        supportsMovieControl = false
+        if comparisonRecordingBusy { comparisonRecordingStatus = "游戏退出前未确认录制保存，请检查素材目录" }
+        isComparisonRecording = false
+        comparisonRecordingBusy = false
         traceRequest?.cancel()
         traceRequestPending = false
         supportsTraceControl = false
@@ -363,8 +431,18 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         synchronizeWorkflow()
         toolbar?.resetMetrics()
     }
-    @objc func stopGame() { requestedStop = true; process?.terminate() }
+    @objc func stopGame() {
+        guard !comparisonRecordingBusy else {
+            comparisonRecordingStatus = "请先停止录制并等待保存，再退出游戏"
+            toolbar?.refreshConfiguration(); return
+        }
+        requestedStop = true; process?.terminate()
+    }
     func shutdown() {
+        if comparisonRecordingBusy, let process {
+            GameMovieRecordingControl.request(processID: process.processIdentifier, start: false)
+        }
+        movieRequest?.cancel()
         interpolationRequest?.cancel()
         traceRequest?.cancel()
         if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }

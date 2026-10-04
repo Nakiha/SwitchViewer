@@ -72,3 +72,7 @@ GitHub 自动检查运行 Swift / Python 回归、macOS 发布构建和 iPad 双
 ## 许可证
 
 [MIT License](LICENSE)，Copyright © 2026 Nakiha。
+
+## 对比视频素材
+
+工具页可同时录制原始采集与插帧后素材，最长 30 秒，供并排或擦拭剪辑使用。操作方法与素材范围见 [录制说明](Docs/comparison-recording.md)。

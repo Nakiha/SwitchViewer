@@ -33,6 +33,7 @@ extension AppDelegate {
     /// previous source can never be presented after a switch.
     @discardableResult
     func beginNewSourceGeneration(reason: String) -> Int {
+        comparisonRecorder.stop()
         frameLock.lock()
         frameInterpolationEpoch += 1
         let epoch = frameInterpolationEpoch

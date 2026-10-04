@@ -11,6 +11,10 @@ import SwitchViewerInterpolation
 extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
     func recordDisplayPresentation(_ frame: PresentationFrame, presentedTime: CFTimeInterval) {
         let wasPresented = presentedTime.isFinite && presentedTime > 0
+        if wasPresented, let time = frame.presentationTimestampHostTime {
+            comparisonRecorder.append(frame.pixelBuffer, track: .processed, hostTime: time,
+                generated: frame.isInterpolated, referenceAspect: frame.referenceAspect.map(Double.init))
+        }
         let timing = frame.timing
         let sample = DisplayLatencySample(
             isInterpolated: frame.isInterpolated,
@@ -184,6 +188,9 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                           presentationTimeStamp: CMTime,
                           captureCallbackHostTime: CFTimeInterval,
                           presentationTimestampHostTime: CFTimeInterval?) -> Double? {
+        if let time = presentationTimestampHostTime {
+            comparisonRecorder.append(pb, track: .original, hostTime: time)
+        }
         displayTimingQueue.async { [weak self] in self?.capturedSourceCount += 1 }
         var signatureSamplingMilliseconds: Double?
         let pf = CVPixelBufferGetPixelFormatType(pb)

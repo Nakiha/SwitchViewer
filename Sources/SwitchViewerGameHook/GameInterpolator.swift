@@ -5,6 +5,7 @@ import GameMetalHook
 import Metal
 import QuartzCore
 import SwitchViewerInterpolation
+import SwitchViewerRecording
 
 @available(macOS 26.0, *)
 final class GameInterpolator {
@@ -57,6 +58,26 @@ final class GameInterpolator {
         traceTimer = timer
         timer.resume()
     }
+    lazy var comparisonRecorder = ComparisonMovieRecorder { event in
+        switch event {
+        case .started(let url):
+            report("MOVIE_RECORD begin path=" + Data(url.path.utf8).base64EncodedString())
+        case .finishing: report("MOVIE_RECORD finishing")
+        case .finished(let url):
+            report("MOVIE_RECORD end path=" + Data(url.path.utf8).base64EncodedString())
+        case .failed(let message):
+            report("MOVIE_RECORD failed detail=" + Data(message.utf8).base64EncodedString())
+        }
+    }
+    func startComparisonRecording() {
+        lock.lock(); let paused = originalView; lock.unlock()
+        guard !paused else { report("MOVIE_RECORD failed detail=" + Data("请先开启插帧".utf8).base64EncodedString()); return }
+        let root = ProcessInfo.processInfo.processName == "GameHookFixture"
+            ? ProcessInfo.processInfo.environment["SWITCHVIEWER_COMPARISON_RECORDING_ROOT"].map { URL(fileURLWithPath: $0) }
+            : nil
+        comparisonRecorder.start(root: root ?? ComparisonMovieRecorder.recordingsDirectory())
+    }
+
     private var lastAcceptedNativeRequest: Double = 0 // Protected by lock.
     private var nextCaptureID: UInt64 = 0 // Protected by lock.
     // Main queue only; counts callbacks awaiting main-queue accounting, not
@@ -281,6 +302,7 @@ final class GameInterpolator {
 
     /// Main-thread A/B comparison without restarting or changing the game files.
     func toggleOriginalView() {
+        comparisonRecorder.stop()
         lock.lock()
         originalView.toggle()
         let paused = originalView
@@ -409,6 +431,7 @@ final class GameInterpolator {
             let current = try converter.makeNV12(from: texture)
             trace.noteConverted(time: convertStart,
                                 milliseconds: (CACurrentMediaTime() - convertStart) * 1_000)
+            comparisonRecorder.append(current, track: .original, hostTime: time)
             previous = current
             previousTime = time
             previousSequence = sequence
@@ -801,6 +824,7 @@ final class GameInterpolator {
                 trace.noteSubmitted(time: submitTime, sequence: sequence, deadline: deadline, expires: expires,
                                     drawableWaitMilliseconds: drawableWait,
                                     encodeMilliseconds: encodeMilliseconds)
+                let recordingAspect = Double(overlay.drawableSize.width / overlay.drawableSize.height)
                 drawable.addPresentedHandler { [self] presented in
                     defer {
                         DispatchQueue.main.async { [self] in
@@ -815,6 +839,9 @@ final class GameInterpolator {
                                               submitTime: submitTime)
                         feedback?.finish(false); return
                     }
+                    comparisonRecorder.append(frame, track: .processed,
+                        hostTime: sourceTime + (original ? 0 : interval / 2), generated: !original,
+                        referenceAspect: recordingAspect)
                     trace.notePresented(time: presented.presentedTime, sequence: sequence,
                                         sourceTime: sourceTime, submitTime: submitTime, deadline: deadline,
                                         drawableWaitMilliseconds: drawableWait,

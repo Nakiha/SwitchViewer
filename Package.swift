@@ -8,18 +8,20 @@ let package = Package(
     targets: [
         .target(name: "GameMetalHook", linkerSettings: [.linkedFramework("Metal"), .linkedFramework("QuartzCore")]),
         .target(name: "SwitchViewerGamePlugins"),
-        .target(name: "SwitchViewerGameHook", dependencies: ["GameMetalHook", "SwitchViewerInterpolation", "SwitchViewerGamePlugins"]),
+        .target(name: "SwitchViewerRecording"),
+        .target(name: "SwitchViewerGameHook", dependencies: ["GameMetalHook", "SwitchViewerInterpolation", "SwitchViewerGamePlugins", "SwitchViewerRecording"]),
         .executableTarget(name: "GameHookFixture"),
         .target(name: "SwitchViewerInterpolation"),
         .executableTarget(
             name: "SwitchViewer",
-            dependencies: ["SwitchViewerInterpolation", "SwitchViewerGamePlugins"]
+            dependencies: ["SwitchViewerInterpolation", "SwitchViewerGamePlugins", "SwitchViewerRecording"]
         ),
         .executableTarget(
             name: "FrameInterpolationLab",
             dependencies: ["SwitchViewerInterpolation"]
         ),
         .testTarget(name: "SwitchViewerInterpolationTests", dependencies: ["SwitchViewerInterpolation"]),
-        .testTarget(name: "SwitchViewerGamePluginsTests", dependencies: ["SwitchViewerGamePlugins"])
+        .testTarget(name: "SwitchViewerGamePluginsTests", dependencies: ["SwitchViewerGamePlugins"]),
+        .testTarget(name: "SwitchViewerRecordingTests", dependencies: ["SwitchViewerRecording"])
     ]
 )

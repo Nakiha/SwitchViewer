@@ -5,6 +5,7 @@ import GameMetalHook
 import Metal
 import QuartzCore
 import SwitchViewerInterpolation
+import SwitchViewerRecording
 
 /// 每条日志都带单调时间（相对 hook 加载的 +秒）和本地墙钟。
 /// 之前 hook 行没有时间戳，只能靠 ADAPT 的 elapsed 反推，误差到秒级。
@@ -40,12 +41,19 @@ public func startGameHook() {
         guard GameHookPluginRuntime.plugin != nil else {
             report("ERROR 未知游戏插件：\(GameHookPluginRuntime.selectedID)；已禁用捕获"); return
         }
+        _ = GameInterpolator.shared.comparisonRecorder
         SVInstallMetalHooks()
         GameFrameTraceControl.observe(processID: ProcessInfo.processInfo.processIdentifier) { _, _, _, _, _ in
             DispatchQueue.main.async { GameInterpolator.shared.startFrameTrace() }
         }
         GameInterpolationControl.observe(processID: ProcessInfo.processInfo.processIdentifier) { _, _, _, _, _ in
             DispatchQueue.main.async { GameInterpolator.shared.toggleOriginalView() }
+        }
+        GameMovieRecordingControl.observe(processID: ProcessInfo.processInfo.processIdentifier, start: true) { _, _, _, _, _ in
+            DispatchQueue.main.async { GameInterpolator.shared.startComparisonRecording() }
+        }
+        GameMovieRecordingControl.observe(processID: ProcessInfo.processInfo.processIdentifier, start: false) { _, _, _, _, _ in
+            DispatchQueue.main.async { GameInterpolator.shared.comparisonRecorder.stop() }
         }
         if ProcessInfo.processInfo.environment["SWITCHVIEWER_FRAME_TRACE"] == "1" {
             GameInterpolator.shared.startFrameTrace()
@@ -65,7 +73,7 @@ public func startGameHook() {
             }
             return event
         }
-        report("LOADED pid=\(ProcessInfo.processInfo.processIdentifier) pipeline=prepared-pair-v24 plugin=\(GameHookPluginRuntime.selectedID) traceControl=darwin-v1 interpolationControl=darwin-v1 cadence=\(GameHookConfiguration().cadence.rawValue) 游戏内 Metal 插帧库已加载，等待画面")
+        report("LOADED pid=\(ProcessInfo.processInfo.processIdentifier) pipeline=prepared-pair-v24 plugin=\(GameHookPluginRuntime.selectedID) traceControl=darwin-v1 interpolationControl=darwin-v1 movieControl=darwin-v1 cadence=\(GameHookConfiguration().cadence.rawValue) 游戏内 Metal 插帧库已加载，等待画面")
     }
 }
 

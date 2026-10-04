@@ -45,6 +45,9 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
     private var refreshButton: NSButton!
     private var gameToggle: NSButton!
     private let gameToggleStatus = NSTextField(labelWithString: "")
+    private var movieButton: NSButton!
+    private var movieFolderButton: NSButton!
+    private let movieStatus = NSTextField(labelWithString: "")
     private var traceButton: NSButton!
     private let traceStatus = NSTextField(labelWithString: "")
     private var currentPage = 0
@@ -137,6 +140,12 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         captureTools = horizontal([action("保存截图", #selector(screenshot)), action("导出诊断", #selector(diagnostics))])
         gameTools = horizontal([traceButton])
         captureRecovery = action("重试渲染", #selector(retryRenderer))
+        movieButton = action("录制对比素材", #selector(recordComparisonMovie))
+        movieButton.toolTip = "同时录制原始帧和处理后帧，最长 30 秒。不含音频、工具栏与最终显示着色；用于剪辑对比。"
+        movieFolderButton = action("打开素材", #selector(openComparisonMovies))
+        movieStatus.font = .systemFont(ofSize: 11)
+        movieStatus.textColor = .secondaryLabelColor
+        let movieRow = horizontal([movieButton, movieFolderButton, NSView()])
         let toolsRow = horizontal([
             captureTools, gameTools, action("打开日志", #selector(logs)), captureRecovery,
             action("退出 SwitchViewer", #selector(quitApplication)), NSView()
@@ -144,7 +153,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         toolsRow.identifier = NSUserInterfaceItemIdentifier("tools-actions")
         toolsRow.alignment = .centerY
         toolsRow.spacing = 12
-        let toolsPage = column([toolsRow, traceStatus])
+        let toolsPage = column([movieRow, movieStatus, toolsRow, traceStatus])
         gameToggle = action("关闭插帧", #selector(toggleGameInterpolation))
         gameToggleStatus.font = .systemFont(ofSize: 11)
         gameToggleStatus.textColor = .secondaryLabelColor
@@ -373,8 +382,16 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         gameDisplaySync.isEnabled = true
         gameCadence.selectItem(at: GamePresentationCadence.allCases.firstIndex(of: owner.gameInjectionController.presentationCadence) ?? 0)
         gameToggle.title = owner.gameInjectionController.isGameInterpolationEnabled ? "关闭插帧" : "开启插帧"
-        gameToggle.isEnabled = owner.gameInjectionController.canToggleGameInterpolation
+        gameToggle.isEnabled = owner.gameInjectionController.canToggleGameInterpolation && !owner.gameInjectionController.comparisonRecordingBusy
         gameToggleStatus.stringValue = gameRunning ? owner.gameInjectionController.interpolationControlStatus : "未运行游戏"
+        let movieBusy = gameRunning ? owner.gameInjectionController.comparisonRecordingBusy : owner.comparisonRecorder.isBusy
+        let recording = gameRunning ? owner.gameInjectionController.isComparisonRecording : owner.comparisonRecorder.isRecording
+        movieButton.title = recording ? "停止录制" : (movieBusy ? "正在保存…" : "录制对比素材")
+        movieButton.isEnabled = recording || (!movieBusy && (gameRunning
+            ? owner.gameInjectionController.canRecordComparison : owner.hasSelectedSource && owner.frameInterpolationEnabled))
+        movieFolderButton.isEnabled = (gameRunning ? owner.gameInjectionController.comparisonRecordingDirectory : owner.comparisonRecordingDirectory) != nil
+        movieStatus.stringValue = gameRunning ? owner.gameInjectionController.comparisonRecordingStatus : owner.comparisonRecordingStatus
+        movieStatus.isHidden = movieStatus.stringValue.isEmpty
         traceButton.isEnabled = owner.gameInjectionController.canRecordGameFrames
         traceStatus.stringValue = owner.gameInjectionController.frameTraceStatus
         traceStatus.isHidden = !gameRunning || traceStatus.stringValue.isEmpty
@@ -395,7 +412,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         operation.state = owner.gameOverlayPanel != nil ? .on : .off
         volume.doubleValue = Double(owner.audioVolume)
         interpolation.isEnabled = owner.hasSelectedSource && !owner.frameInterpolationUnavailable
-        gameInterpolation.isEnabled = owner.gameInjectionController.canToggleGameInterpolation
+        gameInterpolation.isEnabled = owner.gameInjectionController.canToggleGameInterpolation && !owner.gameInjectionController.comparisonRecordingBusy
         interpolation.title = "开启插帧"
         gameInterpolation.toolTip = owner.gameInjectionController.interpolationControlStatus
         backend.isEnabled = owner.hasSelectedSource && !gameRunning
@@ -487,6 +504,8 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         refresh()
     }
     @objc private func toggleGameInterpolation() { owner?.gameInjectionController.toggleGameInterpolation(); refresh() }
+    @objc private func recordComparisonMovie() { owner?.toggleComparisonRecording(); refresh() }
+    @objc private func openComparisonMovies() { owner?.revealComparisonRecording() }
     @objc private func recordGameFrames() { owner?.gameInjectionController.recordGameFrames(); refresh() }
     @objc private func showPreview() { owner?.showPreview() }
     @objc private func fullscreen() { if owner?.hasSelectedSource == true { owner?.goFullscreen(self) } }
