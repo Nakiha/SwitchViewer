@@ -3,8 +3,10 @@
 from pathlib import Path
 import hashlib
 import re
+import json
 
 root = Path(__file__).resolve().parent.parent
+version = json.loads((root / 'Version.json').read_text())
 project = root / 'iPad/SwitchViewerIPad.xcodeproj'
 project.mkdir(parents=True, exist_ok=True)
 existing = project / 'project.pbxproj'
@@ -50,7 +52,8 @@ for kind in ['project', 'target']:
         }
         if kind == 'target':
             settings.update({'PRODUCT_BUNDLE_IDENTIFIER': bundle,
-                             'PRODUCT_NAME': '"$(TARGET_NAME)"', 'INFOPLIST_FILE': 'SwitchViewerIPad/Info.plist',
+                             'PRODUCT_NAME': '"$(TARGET_NAME)"',
+                             'MARKETING_VERSION': version['version'], 'CURRENT_PROJECT_VERSION': str(version['build']), 'INFOPLIST_FILE': 'SwitchViewerIPad/Info.plist',
                              'GENERATE_INFOPLIST_FILE': 'NO', 'TARGETED_DEVICE_FAMILY': '2',
                              'SUPPORTED_PLATFORMS': '"iphoneos iphonesimulator"',
                              'SUPPORTS_MACCATALYST': 'NO', 'CODE_SIGN_STYLE': 'Automatic',

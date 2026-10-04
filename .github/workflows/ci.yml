@@ -1,0 +1,77 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: macOS and iPad
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Record toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          uname -m
+      - name: Validate release version and patch
+        shell: zsh {0}
+        run: |
+          git show --format= --check HEAD
+          version="$(python3 Scripts/write-app-metadata.py --version)"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            print -u2 'Release tag must match Version.json'
+            exit 1
+          fi
+      - name: Swift regression tests
+        run: swift test
+      - name: Diagnostic analysis tests
+        run: python3 -m unittest discover -s Tests -p 'test_*.py'
+      - name: Build iPad device target
+        run: Scripts/build-ipad-app.sh device
+      - name: Build iPad simulator target
+        run: Scripts/build-ipad-app.sh simulator
+      - name: Build and package macOS release
+        run: Scripts/package-release.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  draft-release:
+    name: Prepare prerelease draft
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: macos-release
+          path: dist
+      - name: Create draft with checksums and notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test -f "Docs/releases/$RELEASE_TAG.md"
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag --draft --prerelease \
+            --title "SwitchViewer $RELEASE_TAG · Preview" \
+            --notes-file "Docs/releases/$RELEASE_TAG.md"

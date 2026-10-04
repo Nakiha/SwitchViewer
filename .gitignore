@@ -23,3 +23,4 @@ iPad/**/*.xcuserstate
 
 # Distribute packaged builds through Releases rather than source control.
 /SwitchViewer-*.zip
+/dist/

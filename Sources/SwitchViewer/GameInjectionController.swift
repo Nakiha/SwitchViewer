@@ -1,6 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 import SwitchViewerInterpolation
+import SwitchViewerGamePlugins
 
 /// Launch-time injection only: this controller never edits or re-signs the target.
 final class GameInjectionController: NSObject, NSWindowDelegate {
@@ -155,25 +156,37 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         return candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 
-    @objc func startWuwa() {
-        let defaultURL = URL(fileURLWithPath: "/Applications/鸣潮.app")
-        let installedURL = Bundle(url: defaultURL)?.executableURL != nil ? defaultURL
-            : NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.kurogame.mingchao")
-        launchWuwa(appURL: installedURL ?? defaultURL)
-    }
+    let gamePlugins = GamePluginRegistry.builtIn.plugins
 
-    func launchWuwa(appURL: URL, openURL: (URL) -> Bool = { NSWorkspace.shared.open($0) }) {
-        guard let executable = Bundle(url: appURL)?.executableURL,
+    func startGame(pluginID: String, appURL: URL? = nil,
+                   openURL: (URL) -> Bool = { NSWorkspace.shared.open($0) }) {
+        guard let plugin = GamePluginRegistry.builtIn.plugin(id: pluginID) else {
+            update("找不到该游戏插件，请重新选择。"); return
+        }
+        let installed = appURL ?? GamePluginRegistry.builtIn.installedApplication(for: plugin,
+            isExecutableApplication: { url in
+                guard let executable = Bundle(url: url)?.executableURL else { return false }
+                return FileManager.default.isExecutableFile(atPath: executable.path)
+            }, applicationForIdentifier: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) })
+        guard let installed, let executable = Bundle(url: installed)?.executableURL,
               FileManager.default.isExecutableFile(atPath: executable.path) else {
-            let storeURL = URL(string: "macappstore://apps.apple.com/cn/app/id6450693428")!
-            let webURL = URL(string: "https://apps.apple.com/cn/app/id6450693428?platform=mac")!
-            let opened = openURL(storeURL) || openURL(webURL)
-            update(opened ? "未找到鸣潮，已打开 App Store。安装完成后，回到这里启动游戏。"
-                : "未找到鸣潮，无法打开 App Store，请在商店搜索“鸣潮”并安装。")
+            let opened = plugin.descriptor.installationURLs.contains { openURL($0) }
+            if plugin.descriptor.installationURLs.isEmpty {
+                update("未找到 \(plugin.descriptor.name)，请通过“选择其他 Mac 游戏”指定应用。")
+            } else {
+                update(opened ? "未找到 \(plugin.descriptor.name)，已打开 App Store。安装完成后，回到这里启动游戏。"
+                    : "未找到 \(plugin.descriptor.name)，无法打开 App Store，请在商店搜索并安装。")
+            }
             return
         }
-        launch(appURL: appURL)
+        launch(appURL: installed, plugin: plugin)
     }
+
+    func launchGameApplication(_ url: URL) {
+        let application = GameApplication(bundleIdentifier: Bundle(url: url)?.bundleIdentifier, url: url)
+        launch(appURL: url, plugin: GamePluginRegistry.builtIn.plugin(for: application))
+    }
+
     @objc func chooseGame() {
         let picker = NSOpenPanel()
         picker.allowedContentTypes = [.applicationBundle]
@@ -181,27 +194,28 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         picker.allowsMultipleSelection = false
         picker.directoryURL = URL(fileURLWithPath: "/Applications")
         picker.begin { [weak self] result in
-            if result == .OK, let url = picker.url { self?.launch(appURL: url) }
+            if result == .OK, let url = picker.url { self?.launchGameApplication(url) }
         }
     }
 
     @objc func startFixture() {
         guard let executable = resource("GameHookFixture") else { update("找不到插帧测试程序，请重新构建应用。"); return }
-        launch(executable: executable, name: "插帧测试窗口")
+        launch(executable: executable, name: "插帧测试窗口", plugin: GamePluginRegistry.builtIn.fallback)
     }
 
-    private func launch(appURL: URL) {
-        guard let bundle = Bundle(url: appURL), let executable = bundle.executableURL else {
-            update("找不到鸣潮，请先将鸣潮安装到“应用程序”文件夹。"); return
+    private func launch(appURL: URL, plugin: any GameIntegrationPlugin) {
+        guard let bundle = Bundle(url: appURL), let executable = bundle.executableURL,
+              FileManager.default.isExecutableFile(atPath: executable.path) else {
+            update("找不到有效的游戏应用，请通过“选择其他 Mac 游戏”重新选择。"); return
         }
         if let identifier = bundle.bundleIdentifier,
            !NSRunningApplication.runningApplications(withBundleIdentifier: identifier).isEmpty {
             update("请先正常退出 \(appURL.deletingPathExtension().lastPathComponent)，再从这里启动。"); return
         }
-        launch(executable: executable, name: appURL.deletingPathExtension().lastPathComponent)
+        launch(executable: executable, name: appURL.deletingPathExtension().lastPathComponent, plugin: plugin)
     }
 
-    private func launch(executable: URL, name: String) {
+    private func launch(executable: URL, name: String, plugin: any GameIntegrationPlugin) {
         guard #available(macOS 26.0, *) else { update("游戏内 Apple 插帧需要 macOS 26 或更新版本。"); return }
         guard process == nil else { update("请先退出本次启动的游戏。"); return }
         guard let library = resource("libSwitchViewerGameHook.dylib") else { update("找不到游戏内插帧库，请重新构建应用。"); return }
@@ -213,6 +227,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         // Never propagate an unrelated injection chain into the target game.
         environment["DYLD_INSERT_LIBRARIES"] = library.path
         environment["SWITCHVIEWER_GAME_HOOK"] = "1"
+        environment["SWITCHVIEWER_GAME_PLUGIN"] = plugin.descriptor.id
         environment["SWITCHVIEWER_GAME_PROFILE"] = interpolationProfile.rawValue
         environment["SWITCHVIEWER_GAME_DISPLAY_SYNC"] = displaySyncEnabled ? "1" : "0"
         environment["SWITCHVIEWER_GAME_CADENCE"] = presentationCadence.rawValue

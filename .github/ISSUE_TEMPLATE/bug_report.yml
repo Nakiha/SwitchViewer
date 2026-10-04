@@ -1,0 +1,28 @@
+name: 故障反馈
+description: 报告采集、插帧、声音或界面问题
+body:
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 系统版本、芯片、应用版本或提交号；采集卡型号与模式，或游戏名称和版本。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 请说明使用的功能、游戏插件、插帧开关和显示同步设置。
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: 预期与实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 日志或截图
+      description: 上传前移除个人路径、设备标识和账号信息；性能反馈请说明场景及测量方法。

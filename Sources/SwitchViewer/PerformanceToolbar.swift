@@ -252,7 +252,7 @@ final class PerformanceToolbar: NSPanel {
         guard let owner else { return }
         let text: String
         if owner.gameInjectionController.isGameRunning {
-            text = "游戏插帧 · \(owner.gameInjectionController.runningGameName ?? "鸣潮")"
+            text = "游戏插帧 · \(owner.gameInjectionController.runningGameName ?? "游戏")"
         } else if owner.hasSelectedSource {
             text = "视频采集 · \(owner.selectedSourceName)"
         } else {

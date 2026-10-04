@@ -5,6 +5,7 @@
 #import <objc/runtime.h>
 
 extern void SVGameHookStart(void);
+extern int32_t SVGameHookAcceptsLayer(void *layer);
 extern uint64_t SVGameHookPrepare(void *commandBuffer, void *drawable, void *layer,
                               double nativeRequestTime, double nativePresentedTime, double nativeCallbackTime, double nativeGPUTime);
 static char layerKey;
@@ -152,8 +153,7 @@ void SVInstallMetalHooks(void) {
                 fprintf(stderr, "[SwitchViewerHook] LAYER %.0fx%.0f format=%lu\n", layer.drawableSize.width,
                     layer.drawableSize.height, (unsigned long)layer.pixelFormat);
             }
-            BOOL eligible = ![layer.name isEqualToString:@"SwitchViewer.Interpolation"]
-                && layer.drawableSize.width >= 1024 && layer.drawableSize.height >= 576;
+            BOOL eligible = SVGameHookAcceptsLayer((__bridge void *)layer) != 0;
             if (eligible) {
                 layer.framebufferOnly = NO;
                 @synchronized(hookedDevices) {

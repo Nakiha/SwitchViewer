@@ -2,6 +2,8 @@
 
 现有仓库内的独立 iPad App，最低 iPadOS 26。目标设备为 13 英寸 M5 iPad Pro，支持竖屏与横屏。
 
+当前源码版本为 0.2.0（build 4），与 macOS 共用根目录 `Version.json`；此次源码变更的实际安装与性能仍待真机验收。下文 0.1.x 安装反馈为此前版本的记录。完整平台边界见 [兼容性说明](../Docs/compatibility.md)。
+
 Mac App 继续使用原有 Swift Package 和 `Scripts/build-app.sh`。iPad 工程直接引用 `Sources/SwitchViewerInterpolation` 中选定的公共源文件；不包含 Mac 窗口、屏幕捕获和游戏注入代码。
 
 ## 首版内容

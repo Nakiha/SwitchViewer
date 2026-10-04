@@ -139,14 +139,19 @@ struct WorkflowCheck {
     static func checkMissingGame() {
         let missing = URL(fileURLWithPath: "/nonexistent/SwitchViewerWorkflowCheck/鸣潮.app")
         var urls: [URL] = []
-        owner.gameInjectionController.launchWuwa(appURL: missing) { urls.append($0); return true }
+        owner.gameInjectionController.startGame(pluginID: "wuthering-waves", appURL: missing) { urls.append($0); return true }
         expect(urls.count == 1 && urls[0].scheme == "macappstore" && urls[0].path.hasSuffix("id6450693428"), "missing Wuwa opens its native App Store page")
         expect(!owner.gameInjectionController.isGameRunning && owner.gameInjectionController.status.contains("安装完成后"), "missing game keeps selection workflow with installation guidance")
         urls.removeAll()
-        owner.gameInjectionController.launchWuwa(appURL: missing) { url in urls.append(url); return url.scheme == "https" }
+        owner.gameInjectionController.startGame(pluginID: "wuthering-waves", appURL: missing) { url in urls.append(url); return url.scheme == "https" }
         expect(urls.count == 2 && urls.last?.scheme == "https", "App Store failure falls back to the official web listing")
-        owner.gameInjectionController.launchWuwa(appURL: missing) { _ in false }
+        owner.gameInjectionController.startGame(pluginID: "wuthering-waves", appURL: missing) { _ in false }
         expect(owner.gameInjectionController.status.contains("无法打开 App Store"), "failed store opening leaves manual installation guidance")
+        owner.gameInjectionController.startGame(pluginID: "unknown-plugin") { urls.append($0); return true }
+        expect(owner.gameInjectionController.status.contains("找不到该游戏插件"), "unknown game plugin never launches a target")
+        owner.gameInjectionController.launchGameApplication(missing)
+        expect(owner.gameInjectionController.status.contains("找不到有效的游戏应用")
+            && !owner.gameInjectionController.status.contains("鸣潮"), "generic launch errors never assume Wuwa")
     }
     static func click(_ title: String) {
         let control = button(title)

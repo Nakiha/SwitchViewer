@@ -11,7 +11,7 @@ final class ProjectAboutView: NSStackView {
         orientation = .vertical
         alignment = .leading
         spacing = 14
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发构建"
         let title = NSTextField(labelWithString: "SwitchViewer · \(version)")
         title.font = .systemFont(ofSize: 13, weight: .semibold)
         addArrangedSubview(title)

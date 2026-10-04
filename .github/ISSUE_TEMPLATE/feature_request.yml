@@ -1,0 +1,14 @@
+name: 功能或游戏适配建议
+description: 提出功能改进或新游戏插件需求
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: 使用场景与需求
+    validations:
+      required: true
+  - type: textarea
+    id: game
+    attributes:
+      label: 游戏适配信息（如适用）
+      description: 游戏名称、版本、Mac App 的 Bundle Identifier、渲染接口及已知兼容性。

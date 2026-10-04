@@ -29,9 +29,9 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
     private let floating = NSButton(checkboxWithTitle: "预览窗口置顶", target: nil, action: nil)
     private let passthrough = NSButton(checkboxWithTitle: "鼠标点击穿过预览窗口", target: nil, action: nil)
     private let operation = NSButton(checkboxWithTitle: "全屏覆盖游戏画面", target: nil, action: nil)
+    private var gameLaunchers: [NSButton] = []
     private var pageViews: [NSStackView] = []
     private var sourceViews: [NSStackView] = []
-    private var gameLaunch: NSButton!
     private var gameProcessing: NSStackView!
     private var captureProcessing: NSStackView!
     private var captureOperations: NSView!
@@ -81,11 +81,18 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
             row("插帧偏好", gameProfile), row("显示同步", gameDisplaySync), row("显示节奏", gameCadence),
             NSTextField(labelWithString: "以上偏好在下次启动游戏时生效。")
         ])
-        gameLaunch = action("鸣潮", #selector(startWuwa))
-        gameLaunch.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
-        gameLaunch.imagePosition = .imageLeading
-        gameLaunch.toolTip = "启动鸣潮；未安装时打开 App Store"
-        let gamePage = column([NSTextField(labelWithString: "选择游戏，启动后自动进入插帧面板。"), gameLaunch])
+        let pluginLaunchers = owner.gameInjectionController.gamePlugins.map { plugin in
+            let button = action(plugin.descriptor.name, #selector(startGamePlugin(_:)))
+            button.identifier = NSUserInterfaceItemIdentifier(plugin.descriptor.id)
+            button.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil)
+            button.imagePosition = .imageLeading
+            button.toolTip = "启动 \(plugin.descriptor.name)；未安装时显示安装入口"
+            return button
+        }
+        let genericLauncher = action("选择其他 Mac 游戏", #selector(chooseGame))
+        gameLaunchers = pluginLaunchers + [genericLauncher]
+        let gamePage = column([NSTextField(labelWithString: "选择游戏，启动后自动进入插帧面板。")]
+            + gameLaunchers)
         let screenView = column([row("窗口 / 屏幕", screenPicker)])
         let cardView = column([])
         cardLaunchers = cardView
@@ -372,7 +379,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         traceButton.isEnabled = owner.gameInjectionController.canRecordGameFrames
         traceStatus.stringValue = owner.gameInjectionController.frameTraceStatus
         traceStatus.isHidden = !gameRunning || traceStatus.stringValue.isEmpty
-        gameLaunch.isEnabled = !gameRunning
+        gameLaunchers.forEach { $0.isEnabled = !gameRunning }
         gameCadence.isEnabled = !owner.gameInjectionController.displaySyncEnabled
         startButton.isEnabled = !gameRunning && (sourceKinds.selection == 1 ? !ids.isEmpty : !selectedFormats.isEmpty)
         refreshButton.title = sourceKinds.selection == 1 && !ScreenCaptureSource.hasPermission && !owner.screenContentAccessConfirmed ? "授权屏幕录制" : "刷新来源"
@@ -472,14 +479,15 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         else { refreshDevices() }
         refresh()
     }
-    @objc private func startWuwa() {
-        guard let owner else { return }
-        owner.gameInjectionController.startWuwa()
+    @objc private func startGamePlugin(_ sender: NSButton) {
+        guard let owner, let id = sender.identifier?.rawValue else { return }
+        owner.gameInjectionController.startGame(pluginID: id)
         if !owner.gameInjectionController.isGameRunning && !owner.gameInjectionController.status.contains("已打开 App Store") {
             showLaunchError(owner.gameInjectionController.status)
         }
         refresh()
     }
+    @objc private func chooseGame() { owner?.gameInjectionController.chooseGame() }
     @objc private func toggleGameInterpolation() { owner?.gameInjectionController.toggleGameInterpolation(); refresh() }
     @objc private func recordGameFrames() { owner?.gameInjectionController.recordGameFrames(); refresh() }
     @objc private func showPreview() { owner?.showPreview() }
