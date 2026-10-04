@@ -273,6 +273,7 @@ struct WorkflowCheck {
         expect(!visible("关于"), "game runtime hides about")
         expect(workflowTitle.stringValue == "游戏插帧 · 插帧测试窗口", "game runtime moves the game name into the toolbar title")
         validateLayout()
+        checkCompactMetricsLayout()
         let toggle = button("开启插帧")
         toggle.state = .off
         toggle.sendAction(toggle.action!, to: toggle.target)
@@ -280,6 +281,24 @@ struct WorkflowCheck {
             expect(!owner.gameInjectionController.isGameInterpolationEnabled, "shared processing toggle pauses actual game interpolation")
             gamePanels()
         }
+    }
+    static func checkCompactMetricsLayout() {
+        let content = panel.contentView!
+        let label = descendants(content).compactMap { $0 as? NSTextField }
+            .first { $0.identifier?.rawValue == "compact-metrics" }!
+        var frames: [NSRect] = []
+        for (fps, latency) in [(9.0, 1.0), (999.0, 999.9), (60.0, 16.7)] {
+            panel.receive(PerformanceMetrics(fps: fps, latency: latency, p95: latency,
+                processing: 1, wait: 1))
+            content.layoutSubtreeIfNeeded()
+            let tabFrame = tabs.convert(tabs.bounds, to: content)
+            expect(label.convert(label.bounds, to: content).maxX < tabFrame.minX,
+                "compact metrics stay left of the runtime tabs")
+            frames.append(tabFrame)
+        }
+        expect(frames.dropFirst().allSatisfy { abs($0.minX - frames[0].minX) < 0.5
+            && abs($0.width - frames[0].width) < 0.5 },
+            "changing metric digit counts does not move or resize tabs")
     }
     static func gamePanels() {
         select(1)

@@ -107,6 +107,10 @@ final class PerformanceToolbar: NSPanel {
         compactMetrics.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         compactMetrics.textColor = .secondaryLabelColor
         compactMetrics.toolTip = "实际显示帧率 · 取帧到显示 P50"
+        compactMetrics.identifier = NSUserInterfaceItemIdentifier("compact-metrics")
+        compactMetrics.widthAnchor.constraint(equalToConstant: 132).isActive = true
+        compactMetrics.lineBreakMode = .byTruncatingTail
+        compactMetrics.maximumNumberOfLines = 1
         let about = button("info.circle", label: "关于 SwitchViewer", action: #selector(toggleAbout))
         aboutButton = about
         about.title = "关于"
@@ -120,7 +124,7 @@ final class PerformanceToolbar: NSPanel {
         if #available(macOS 26.0, *) { endSession.bezelStyle = .glass }
         endSession.isHidden = true
         compactMetrics.isHidden = true
-        let row = NSStackView(views: [icon, brand, NSView(), tabs, NSView(), compactMetrics, endSession, about, hide])
+        let row = NSStackView(views: [icon, brand, NSView(), compactMetrics, tabs, NSView(), endSession, about, hide])
         row.spacing = 8
         row.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(row)
