@@ -1,0 +1,277 @@
+# SwitchViewer 插帧实验记录
+
+日期：2026-09-27  
+设备：Apple M5  
+
+## 采集卡样本
+
+- `switch2-capture-3s.mov`：3 秒，3840×2160，60Hz，NV12 输入转 HEVC 保存，共 180 帧。
+- `switch2-capture-3s.json`：每帧的原始 Y 平面抽样亮度变化指标和时间戳。
+- 录制时没有观察到采集丢帧。样本内容是 Switch 视频输出设置界面，能验证信号节奏，不能代表快速游戏场景的运动质量。
+
+## 节奏检测
+
+检测器从 128×72 的稀疏亮度网格跟踪空间位置各自的帧间变化。连续 12 个采集间隔中，按 2 相或 3 相分组比较变化量：低变化相位视为重复画面，高变化相位视为游戏更新。小范围的 60Hz UI 动画不会单独把整屏判成 60fps 游戏。
+
+- 实际样本：检测到 60Hz 采集、30Hz 游戏，167 个可分类间隔中 166 个与录制时的原始 Y 平面指标一致（99.4%）。
+- 合成混合画面：30fps 游戏 + 60fps UI，检测为 30fps，置信度 100%。
+- 合成混合画面：40fps 游戏 + 60fps UI，检测为 40fps，置信度 99%。
+- 合成原生 60fps 画面不会被误判成重复节奏，预热后仍进入正常插帧器。
+- 12 个采集间隔用于覆盖 30fps 的 6 个周期或 40fps 的 4 个周期；因此刚启动时约需 200ms 才稳定报告节奏。
+- 已把策略接入 app 源码里的低延迟插帧器：检测预热期间直接显示原帧；稳定检测后，重复游戏帧直接显示原帧、不调用系统插帧器；更新帧才调用插帧器。真实样本的 167 个已分类间隔中，82 个会跳过插帧，约减少一半的插帧调用。
+
+## 4K 合成实验
+
+运动估计输入可以缩小，输出仍保持 3840×2160 NV12。下面的亮度误差来自平移纹理测试：数值越低越接近人工生成的理想中间帧；简单叠帧对照为 43.78。它是可重复的质量探针，不等同于主观游戏画质。
+
+| Vision 光流输入 | 4K 输出 | 理想帧亮度误差 | 暖机后 Vision 光流耗时 | 结论 |
+|---|---:|---:|---:|---|
+| 3840×2160 | 3840×2160 | 8.44 | 24–33ms | 质量最好，运动估计较慢 |
+| 2880×1620（75%） | 3840×2160 | 12.86 | 21–25ms | 当前质量/速度折中较好 |
+| 2400×1350（62.5%） | 3840×2160 | 30.63 | 15–21ms | 更快，纹理运动估计误差增加 |
+| 1920×1080（50%），低精度 | 3840×2160 | 37.11 | 14–18ms | 仍优于叠帧探针，但质量损失明显 |
+| 1440×810（37.5%） | 3840×2160 | 42.74 | 14–27ms | 接近简单叠帧，不建议 |
+| 1920×1080（50%），中精度 | 3840×2160 | 42.17 | 20–26ms | 此探针上没有明显优于叠帧 |
+
+首次 Vision 调用另有约 110–152ms 的冷启动尖峰；表内耗时排除了每轮第一次调用。缩小只影响光流计算，采集和合成结果没有降到 1080p。全流程还包含 GPU 缩小和 4K Metal 合成；它们在本机各参数下约为 1–5ms。
+
+## 当前边界
+
+插帧策略不做 UI 或游戏区域遮罩：更新帧之间仍由系统插帧器处理完整画面，因此动态 UI 也可能出现在生成帧里；重复游戏帧则完全不调用插帧器。策略已接入 app 源码并通过本机编译，但没有替换正在运行的 `SwitchViewer.app`，也没有验证端到端显示延迟。独立 Metal 光流缩放实验尚未接入 app 的 VideoToolbox 插帧路径。
+
+真实样本是设置界面，能验证帧率节奏，不能评价快速游戏画面的插帧质量。画质数据只来自平移纹理探针。
+
+## 2026-09-27：游戏帧时间戳与运行耗时
+
+- 节奏检测结果现在提供“距离上一张不同游戏帧经过了几个采集间隔”。检测到 30/40fps 内容后，插帧输入会从最近的不同游戏帧取缓冲和时间戳，而不是拿最近一次 60Hz 采集的重复画面时间戳计算游戏帧间隔。
+- 插帧运行日志每约 3 秒输出一次 P50/P95：节奏检测、处理队列等待、光流输入缩放、Vision 光流、Metal 合成、后端总耗时和采集到处理完成耗时，并标注后端及识别到的游戏帧率。
+- 本轮 `swift build` 成功。尚未替换正在使用的 `SwitchViewer.app`，也没有接真实游戏画面测量呈现时序；采集到处理完成不代表光子级显示延迟。4K 游戏旋转视角仍需实机观感验收。
+
+## 2026-09-27：插帧积压修复
+
+- 诊断包在 4K60 下出现每帧节奏分析约 42ms、光流 P95 约 183ms；插帧队列等待升至 9 秒，导致预览播放旧帧而不是实时画面。
+- 捕获输入现在使用单帧最新值缓冲：分析忙碌时淘汰过期输入，不再把每个采集回调都排进串行队列。这样优先保持实时预览；机器负载不足时可能少生成一些中间帧。
+- 此次独立包使用 Swift release 构建，避免调试配置拖慢 4K 帧分析。仍需用户连接采集卡实机确认持续帧率及画面延迟。
+
+## 2026-09-27：双向光流实验
+
+- 新增独立的“双向光流（实验）”模式，保留标准光流作 A/B 对比，并移除快速运动旁路选项。
+- 对同一对不同游戏帧并行估计前向与反向 Vision 光流；Metal 在 4K 输出网格上迭代映射前后来源，并按往返一致性为两侧像素计算权重，遮挡或边界不一致时减少错误来源的叠加。低置信区域选择时间上较近的来源像素，仍然生成每个目标时刻的输出帧。
+- 当前运动场仍在 75% 尺寸计算，画面输出保持原始分辨率。Swift release 构建与独立 Metal shader 编译通过；双向算法尚未连接真实采集画面做画质或持续帧率验收。运行日志中的光流耗时会包含两次 Vision 请求。
+
+## 2026-09-27：Apple 低延迟模式
+
+- 新增独立的“Apple 低延迟插帧（仅 1080p）”菜单模式，调用 VideoToolbox `VTLowLatencyFrameInterpolationConfiguration`；Apple 路径不再隐式替代“标准光流（自研）”。自研光流在 1080p 和 4K 都保持可选，原始采集分辨率作为输出分辨率。
+- 本机 M5 的 1920×1080 配置支持输入像素格式 `420v`（视频范围 NV12）。菜单仅在当前输入为 1920×1080 且格式受支持时可选；切到其他分辨率后 Apple 模式置灰并显示原帧，不会把画面缩到 1080p，也不会自动切换其他插帧后端。
+- Swift release 构建通过，项目目录中的 `SwitchViewer.app` 已更新并通过代码签名校验。尚未在接入采集卡的 1080p 实时输入上验证 VideoToolbox 会话、插帧观感或延迟。
+
+## 2026-09-27：Apple 插帧快速重启崩溃
+
+- 崩溃报告显示主进程在 `VTFrameProcessor.process(parameters:completionHandler:)` 内触发 `EXC_BAD_ACCESS`，更深的栈位于 VideoToolbox 的 telemetry mutex；自动日志确认崩溃发生在 Apple 模式关闭后再次开启、第一次重新提交插帧时，之前长时间运行正常。
+- 每次重新 `startSession` 都改为创建全新的 `VTFrameProcessor` 实例，避免复用结束过的系统处理器。已编译修复；需要用户在相同的关闭/开启对比操作下确认不再崩溃。
+
+## 2026-09-27：Apple 4K 代理插帧
+
+- 本机 VideoToolbox 的低延迟插帧支持 1920×1080 NV12 时间插值，但 Apple 空间模式的能力查询只给出 640×360 输入上限；1080p→4K 的低延迟超分档位不可用。空间模式配置虽能创建，实际处理采集帧仍返回 `Processor is not initialized`。
+- 验证整帧代理路径：先在 Metal 上直接缩放 NV12 的 Y/UV 平面到 1920×1080，交给 Apple 低延迟插帧，再用 Metal Catmull-Rom 放大回 3840×2160。这样 Apple 看到整张画面，没有分块运动上下文断裂，也不经过 RGB 色彩转换。
+- 对采集素材第 169→171 帧运行 1 次预热和 5 次计时：最新一轮预热 42.4ms；后续中位数 20.2ms，其中 Metal 尺寸转换 7.9ms、Apple 插帧 12.0ms。输出缓冲仍是 3840×2160 NV12。原始与合成输出的全帧均值为 YUV 95.5/134.0/135.3 与 95.1/134.2/135.5，未见此前 Core Image RGB 转换造成的亮度抬升。
+- 该路径的运动估计只有 1920×1080 像素信息，最终 4K 只是放大输出，细线和纹理会变软；它没有恢复丢失的原生 4K 高频细节。是否接受需要在实际游戏里对比观看。
+- 也测了四个 1920×1080 图块并行处理再拼回 4K：总耗时中位数约 40.3ms，超过 30fps 游戏每个中间帧的 33.3ms 预算，且图块交界出现明显接缝，因此没有选为 app 路径。
+- 新增菜单实验项“Apple 低延迟插帧（4K代理，细节软化）”，只对 3840×2160 NV12 开放；原生 Apple 1080p 模式与自研 4K 光流仍独立保留。当前完成源码及真实素材探针验证，尚未在采集卡实时预览里验收帧率、颜色和交互延迟。
+- Swift release 构建通过，项目目录中的 `SwitchViewer.app` 已更新并通过签名校验。更新前的可执行文件保存在忽略文件目录 `Artifacts/SwitchViewer-pre-apple-proxy-20260927`。更新前启动的 app 进程仍在运行，退出后重新打开才会载入新菜单；ad-hoc 签名的代码哈希变化后，macOS 可能再次请求相机/麦克风权限。
+
+## 2026-09-27：Apple 四图块并行会话追踪
+
+- 给独立实验探针增加每个 `VTFrameProcessor` 会话的 `startSession` 调用耗时、每个 tile 的 `process` 同步调用耗时、请求至异步回调的墙钟耗时，以及回调相对批次起点的时间；可用 1、2、4 个会话作对照。这里的回调延迟包含 VideoToolbox 排队、调度和处理，不是 Apple 内部 GPU/神经引擎纯执行时间。
+- 四会话实测：4 个会话按顺序调用 `startSession` 分别耗时 51.0、33.8、33.4、33.5ms；一次预热插帧 59.9ms。之后 5 次总耗时中位数 58.6ms，其中四个异步请求的等待阶段中位数 54.3ms、准备 2.1ms、拼接 1.2ms。最后一次四个请求在批次开始后 0.01–0.05ms 内发出，`process` 调用自身耗时 0.00–0.02ms；回调分别在 15.96、25.72、34.76、54.08ms 后完成，整批必须等最慢的回调。
+- 为区分会话并行和单会话重复处理，用同一 2×2 tile 探针测了 1/2/4 会话：Apple 回调等待阶段的五次中位数分别为 54.3、60.6、54.3ms；四会话相对单会话没有可见的墙钟吞吐提升，双会话结果反而更慢，差异落在当前机器负载与运行波动范围内。总耗时中位数分别为 57.2、64.8、58.6ms。
+- 同一采集片段的整帧 1080p 代理路径耗时中位数为 19.1ms，其中 Apple 回调等待 14.7ms、缩放 4.0ms。四个图块总像素数是单张 1080p 的四倍；54.3/14.7≈3.7，符合“吞吐接近按像素工作量增长”的观察。四图块仍超过 30fps 的 33.3ms 中间帧预算；整帧代理在此探针中低于该预算，但会软化 4K 细节。
+- 测量期间 SwitchViewer 进程仍在运行，采样到约 35–48% CPU；因此这些结果不是空载基准，不能把 54.3ms 当作机器空闲时的固定值。上一轮未记录逐路回调的约 40.3ms 不能与这次逐路数据直接对齐；应以控制负载、同素材重复测量后再给出稳定基准。
+- 公开的 `VTFrameProcessor.process` 是异步接口，回调在处理完成时触发；Apple 文档也提醒低延迟插帧 `startSession` 时的机器学习模型加载可能超过一个帧时长。公开接口没有暴露内部算力单元利用率或各 tile 的 GPU 执行区间，因此本次只能确认请求提交、回调延迟和并行无吞吐收益，不能断言 Apple 把四路计算内部严格串行化。
+
+## 2026-09-27：实时处理与实际上屏时延
+
+- 从当前运行实例的自动日志取最近 50 个三秒统计窗口（约 20:06:46–20:09:14，3840×2160 NV12@60、Apple 4K 代理、游戏节奏约 30fps）。每项列的是“窗口内 P50/P95”的跨窗口分布：队列等待的中位窗口 P50 为 0ms、P95 为 22.5ms；4K→1080p 代理预处理为 4.8/8.8ms；插值 provider 总耗时为 15.7/23.2ms；采集回调到插值完成为 26.1/44.1ms。处理完成 P95 的第 95 百分位为 45.6ms，最大窗口 P95 为 46.9ms。
+- 这些阶段的分位数不能直接相加；provider 已包含预处理，因此 `preprocess` 是 provider 的子项。队列等待主要解释尾部延迟：其跨窗口 P95 中位数 22.5ms，而 P50 为 0ms。当前日志里没有“真正上屏”的时间戳，所以以上数据不等同于端到端显示时延。采样时旧版 app 进程约占 23.6% CPU，属于正在工作的负载数据，不是空载基准。
+- 新增实际显示测量：用 `AVCaptureSession.synchronizationClock` 将采集 PTS 转换到 host clock；用 `MTLDrawable.addPresentedHandler` / `presentedTime` 记录 drawable 真正显示的时刻。自动日志按插值帧、采集帧分别输出 P50/P95，区分 capture callback→display 与媒体 PTS→display，并计入没有实际呈现的 drawable。它包含 Metal drawable 和 compositor/vsync 等待，但不能分离显示器面板扫描延迟。
+- 优化 4K 节奏检测的逐像素分类循环，消除每个采样点的临时数组与过滤分配。相同 180 帧 4K 片段离线对比：检测耗时 P50/P95 从 2.86/2.98ms 降至 0.38/0.57ms；30fps 重复帧识别、40fps/60fps 节奏探针结果保持一致。这个优化只减少 CPU 工作，不会单独消除 Apple provider 的处理时间或队列尾延迟。
+- Swift release 构建通过；新版已装入 `SwitchViewer.app` 并通过严格签名校验。旧运行进程没有被重启，仍继续采集；因此新上屏日志要等手动退出并重开 app 后才开始出现。更新前的可执行文件保存在 `Artifacts/SwitchViewer-pre-latency-20260927`。这个包使用 ad-hoc 签名，CDHash 改变后 macOS 可能在下一次启动时重新询问相机和麦克风权限。
+- 后续应在同一场景记录新版本的 `实际上屏时延`，再决定是否把串行插值输入从“两帧等待队列”改成 latest-only，或压低 presentation/drawable 并发。前者会主动丢掉更多待处理更新帧、后者可能损失吞吐，因此先用实测判断，不先盲改帧率/队列策略。
+
+## 2026-09-27：新版实机上屏测量
+
+- 用户重开新版后，确认实时输入为 UGREEN 95348、3840×2160 NV12@60，Apple 4K 代理插帧开启，内容节奏识别为 30fps。统计最近 20 个约三秒窗口（20:27:20–20:28:17）：插值帧从 capture callback 到 drawable 实际呈现的窗口 P50/P95 中位数为 91.5/99.8ms；采集帧为 100.5/109.3ms。按各自媒体 PTS 计算，插值帧到呈现为 138.4/146.7ms，采集帧为 130.1/138.4ms。最新单窗口分别为 91.3/99.7ms、100.2/109.0ms、138.3/146.6ms 和 129.9/138.3ms。少数窗口峰值到约 155ms。
+- 最新处理窗口的 capture-to-ready 是 25.0/34.2ms，provider 为 23.8/26.1ms，队列为 0/17.0ms。显示延迟显著高于处理耗时；即使扣除插值处理，仍约有 60–75ms 在 drawable 呈现前。最近这些显示统计的 `noPresentation` 为 0，记录到的 drawable 均有呈现回调。
+- 代码路径上 `presentationQueue` 串行提交帧，`MetalRenderer.render` 在 command buffer `commit()` 后即返回，presentation slot 也在提交后释放；因此 Metal/CoreAnimation 中待呈现帧的积压是值得继续查的方向，但当前日志尚未单独测出队列开始、`nextDrawable()` 返回、GPU command buffer 完成和最终呈现的各阶段耗时，暂不能把延迟归因到其中某一个点。下一轮应先拆分这些阶段，再 A/B 降低在途帧数和明确帧节奏；直接缩小队列可能丢掉更多帧，需要同时看上屏 P95 和流畅度。
+- 再看 20:28:57–20:29:54 的最近 20 窗口后，插值帧 callback→display 为 90.5/99.0ms、PTS→display 为 137.9/146.3ms；采集帧 callback→display 为 99.8/109.0ms、PTS→display 为 129.7/138.1ms。20:30:09 单窗口与之相符：插值帧 90.0/98.6ms、采集帧 99.1/114.8ms（callback→display），所有采样 drawable 均已呈现。
+
+## 2026-09-27：低在途帧呈现实验
+
+- 把 `CAMetalLayer.maximumDrawableCount` 和 app presentation slot 上限都设为 2；每个 slot 保留到 `MTLDrawable` presented handler 回调后释放。旧路径在 command buffer `commit()` 后就释放 slot，因此可能把帧继续排进 Metal/CoreAnimation。启动日志会标出 `inFlightLimit=2`，方便确认实验版本。
+- Release 构建及 app 签名校验通过。正在运行的进程仍是旧版，未打断当前采集；本实验的时延和丢帧变化需在下一次重开后比较。因为代码签名哈希变化，macOS 可能重新询问相机/麦克风权限。回滚二进制保存在 `Artifacts/SwitchViewer-pre-lowlatency-present-20260927`。
+- 新实验包替换前，旧进程 20:42:11 的基线窗口为：插值帧 PTS→display 143.3/151.6ms，采集帧 135.0/143.3ms；两者 callback→display 分别为 91.3/99.4ms、100.3/109.2ms。同期 capture-to-ready 为 25.2/33.0ms。
+
+## 2026-09-27：低在途帧实验实机结果
+
+- 新进程在 20:43:54 启动，日志确认 `maximumDrawableCount=2`、`inFlightLimit=2`。用 20:56:09–20:57:40 最近 20 个呈现窗口统计：插值帧 callback→display 的窗口 P50/P95 中位数为 41.9/50.1ms；采集帧为 57.6/66.5ms。按各自媒体 PTS 计算，两类均约 89.5–89.6/97.8ms。所有已统计 drawable 均实际呈现（`noPresentation=0`）。
+- 同期处理窗口的 P50/P95 中位数：节奏分析 0.6/0.9ms，处理队列 0.1/0.1ms，4K→1080p 代理缩放 7.6/10.2ms，Apple VideoToolbox 15.4/16.4ms，provider 总计 22.9/25.9ms，采集回调到插值完成 23.6/27.1ms。provider 已包含代理缩放，不能把两者再次相加。处理队列基本空，主要计算耗时是代理缩放与 Apple 处理。
+- 和双在途实验前基线相比，PTS→display 从约 130–152ms 降到约 90–98ms，减少约 40–55ms。以分位数中位数相减估算，插值完成后到插值 drawable 实际显示还剩约 18ms（P50）；这是近似值，不是同一批逐帧配对数据。当前日志还不能把这段继续拆成 `nextDrawable()` 等待、GPU 命令完成和合成器/vsync。
+- 当前 20 个窗口里每约 3 秒呈现 48 张插值帧和 90 张采集帧，合计约 46fps。新进程运行约 810 秒后，成功 Metal 帧数增加 37,570（约 46.4/s），`dropped` 增加 34,490（约 42.6/s），插值帧约 15.2/s；插值失败为 0。`dropped` 混合了最新输入替换、待处理队列淘汰和呈现名额不足，现有日志没有按原因拆计，因此不能把全部丢弃归到单个环节。
+- 当前内屏实际模式为 120Hz（CoreGraphics 当前显示模式回读），所以面板刷新率不是约 46fps 的硬上限。代码路径显示 30fps 游戏更新时会排入“中间帧+源帧”，而识别为重复游戏画面的输入虽然不再调用 Apple 插帧，仍会作为源帧排呈现；同时每对帧会竞争两个在途名额，名额不足时优先保留源帧。按 60Hz 采集加 30fps 中间帧计算，工作负载最高可要求约 90 次呈现/秒；这与当前大量丢弃及插值帧仅约 15–16/s 一致，但具体丢弃原因仍需独立计数确认。
+- 下一轮应先给 `dropped` 分原因计数，并单独量 `presentationQueue` 等待、`nextDrawable()` 等待、GPU 完成及 drawable 呈现。随后测试“只不重画整帧确实未变化的采集缓冲”以释放呈现预算；不能仅凭“游戏画面重复”就跳过源帧，因为其中 HUD/系统 UI 可能仍在 60Hz 更新。内屏为 120Hz，也可在同一场景比较 2 与 3 个在途名额的延迟/吞吐折中。
+
+## 2026-09-27：完全相同源帧去重
+
+- 在插帧呈现入口比较最近一次获准呈现的源帧与当前源帧：尺寸、像素格式、色彩矩阵附件和两张 NV12 平面的缓冲内容必须完全一致才省略源帧提交。Metal 层会保留上一 drawable；任何 HUD/UI 像素变化都会使整帧比较失败并继续呈现。去重发生在双帧名额分配前，因此只剩一个名额时，中间帧不再仅因同批重复源帧而被源帧替换。
+- 新版日志增加输入队列淘汰、呈现名额丢弃、Metal 渲染失败、完全重复源帧省略数量，以及整帧比较平均/最大耗时；保留双在途上限 2，以单独观察去重对吞吐的影响。
+- 顺手把颜色矩阵附件读取改为 `CVBufferCopyAttachment`；旧的 `CVBufferGetAttachment` Swift 转换会将 `Unmanaged` 直接转成 `String`，编译器提示该转换恒失败。
+- Release 编译完成，临时 app 包与安装版均通过严格签名校验。旧可执行文件备份在 `Artifacts/SwitchViewer-pre-exact-dedupe-20260927`。没有重启正在运行的 PID 77692，所以这项优化尚未在实时采集里测帧率或逐帧比较耗时；下一次启动时会从状态日志标记 `exactSourceDedupe=fullNV12` 确认是否进入新版。ad-hoc 签名哈希变化可能让 macOS 再次询问相机/麦克风权限。
+
+## 2026-09-27：上屏路径分段计时
+
+- 新分段日志启用前的同一运行实例基线（约 21:59:06–21:59:51，16 个约 3 秒窗口的分位数中位值）：插值帧 callback→display 为 35.9/36.8ms、PTS→display 为 78.1/78.2ms；采集帧 callback→display 为 35.9/36.9ms、PTS→display 为 69.8/69.8ms。处理 provider 为 13.3/16.8ms。状态 FPS 约 60，但内容节奏当时未识别；这是之后验证分段计时是否解释总时延的基线。
+- 为每个呈现帧记录处理完成、呈现队列入队/开始、`nextDrawable()` 等待、drawable 获取、Metal command buffer 提交、GPU 完成和实际呈现时间；每 3 秒按插值帧/采集帧分别写 P50/P95 到自动滚动日志。
+- 新字段为 `callbackToReady`、`readyToEnqueue`、`presentationQueueWait`、`queueStartToDrawable`、`nextDrawableWait`、`drawableToSubmit`、`gpuSubmitToComplete`、`gpuCompleteToDisplay`。`queueStartToDrawable` 包含 `nextDrawableWait`，不能与它相加；整体时延和各阶段分位数也不应直接相加。
+- Release 构建成功，安装包严格签名校验通过。旧可执行文件保存在 `Artifacts/SwitchViewer-pre-stage-latency-20260927/Contents/MacOS/SwitchViewer`。为保留当前采集，未重启旧进程 PID 78582；新分段日志将在新版下次启动后出现。当前 app 使用 ad-hoc 签名，签名哈希变化可能触发 macOS 再次询问相机/麦克风权限。
+
+## 2026-09-27：解锁后 CoreMediaIO 卡死与防空闲锁屏
+
+- `sample 78582 2` 在 22:52:46 抓到卡死线程：主线程位于 CoreMediaIO 的 `session:availableExtensionsChanged → RefreshExtensionConnection → Device::Resume → CAMutex::Lock`；其他 CMIO 线程分别卡在同一设备属性锁，以及 `CGGUIConsoleSessionChangedHandler → Device::Suspend → Stream::Stop → completeTransaction → dispatch_group_wait`。采样期间未见 SwitchViewer 的插帧或 Metal 计算栈；证据指向 macOS CoreMediaIO 在锁屏/解锁时暂停、恢复采集卡的同步路径阻塞，不能仅凭一次采样断言锁的持有者或精确死锁环。
+- 增加 `IOPMAssertion`，采集会话成功运行时持有 `PreventUserIdleDisplaySleep`，会话重配时释放后重新申请，设备断开和应用退出时释放；自动日志记录启用状态/系统返回码。Apple 文档说明它阻止因用户空闲导致的显示器变暗/睡眠，系统仍可因其他原因睡眠，所以不屏蔽手动锁屏、合盖或低电量等显式/系统事件。
+- Release 编译与严格签名校验通过，新二进制已安装。PID 80060 于 22:55:50 启动，持续产生活跃的 4K 采集和分段呈现日志；为避免打断这次采集，未重启该进程，因此它尚未持有新加的防睡眠断言。下次启动新版后，应从 `采集期间防空闲锁屏; enabled=true; result=0` 日志确认断言生效。当前仍为 ad-hoc 签名，macOS 可能再次询问相机/麦克风权限。
+
+## 2026-09-27：三在途帧吞吐实验
+
+- 为单独测呈现预算，把 `CAMetalLayer.maximumDrawableCount` 和 presentation semaphore 从 2 同时提高到 3；其余插帧、去重、丢帧优先级和图像路径不变。启动日志会打印实际上限。
+- 替换前旧进程 PID 80350 的最近 45 秒基线：输出约 46.5fps；插值帧 callback→display P50/P95 为 45.7/47.2ms，采集帧为 54.5/63.5ms；PTS→display 分别为 89.6/89.6ms、81.2/89.6ms；Apple provider 为 21.4/28.0ms。该旧进程继续采集，安装版要等用户重开后才生效。
+- Release 构建及新 app 严格签名校验通过。旧 app 完整副本保存在 `Artifacts/SwitchViewer-pre-3flight-20260927.app`，被替换的运行版也保存在 `Artifacts/SwitchViewer-running-old-3flight.app`。重开后对比帧率、`presentationLimitDrops` 增速、两类帧 callback→display 与 PTS→display；若吞吐上涨但 P95 时延明显恶化，则回到双在途版本。
+
+## 2026-09-28：三在途帧实机结果
+
+- 用户重开后，00:01:25 启动日志确认 `maximumDrawableCount=3`、`inFlightLimit=3`。00:08:48–00:11:48 的 60 个约三秒窗口中，状态稳定在 60fps；4K60 NV12、Apple 4K→1080p 代理插帧开启，插帧失败和 Metal 渲染失败均为 0。采集防空闲锁屏断言为 `enabled=true; result=0`。
+- 同期插值帧 callback→display 的窗口 P50/P95 中位数为 52.3/53.3ms，采集帧为 69.0/69.9ms；两类 PTS→display 都约 98.8ms。provider 为 21.1/26.6ms，GPU submit→complete 约 0.8/4.0ms（插值帧）、1.1/4.2ms（采集帧）。
+- 重启前双在途版本约 46.5fps；最近窗口插值帧 callback→display 为 45.7/47.2ms，采集帧 54.5/63.5ms，PTS→display 分别约 89.6/89.6ms、81.2/89.6ms。三在途将吞吐提高到 60fps，但显示时延上升，尤以采集帧 GPU 完成到显示阶段为明显；provider 耗时基本不变。重启后累计呈现名额丢弃 248、输入队列丢弃 9，不能和重启前不同运行时长的累计数直接比较。
+- 结论：三在途解决了当前吞吐不足，但增加了呈现排队延迟。接下来应优化按游戏节奏的呈现时序/减少多余源帧上屏，而不是继续增加在途名额或先优化 Apple 插帧运算。
+
+## 2026-09-28：显示刷新驱动呈现 A/B
+
+- 保持 3 个 drawable / app slots，新增可运行时切换的呈现策略：默认“尽快呈现（低时延实验）”使用普通 `present(drawable)`，把何时进入下一次屏幕刷新交给系统；“按检测节奏限速（原方式）”保留 `present(afterMinimumDuration:)`，可从“画面 → 呈现节奏”菜单切回。切换只影响之后生成的帧，不重启插帧器。
+- 安装前的旧进程 PID 81045 仍运行 3/3 + minimum-duration 路径；00:27–00:30 的近 3 分钟窗口插值帧 callback→display 为 39.8/55.8ms，采集帧 48.8/65.4ms，PTS→display 两类约 82.1/98.8ms，provider 14.6/23.8ms。周期状态的成功渲染计数约 76.5fps，场景节奏会影响这个数值。
+- Release 构建和 app 严格签名校验通过。新菜单需重开 app 一次；启动/周期日志会记 `presentationPacing`，之后可在同一场景切换 A/B。新模式尚未在实际屏幕上测量，不能预判时延一定更低。旧 3/3 稳定节奏 app 保存在 `Artifacts/SwitchViewer-pre-display-driven-pacing-20260928.app`。
+- 用户重开后 PID 81693（00:32:34 启动）确认 `presentationPacing=尽快呈现（低时延实验）`。00:33:09–00:35:09 两分钟窗口：状态约 59fps，4K60 NV12，游戏节奏识别 30fps；插值帧 callback→display P50/P95 为 45.4/53.7ms、PTS→display 88.9/97.2ms；采集帧分别为 53.7/62.0ms、80.6/88.8ms。provider 21.6/27.5ms，其中预处理 7.3/11.9ms、Apple 14.4/16.3ms；presentation queue 基本为 0，GPU submit→complete 约 0.8–1.2/3.8–4.2ms。插值失败及 Metal 渲染失败均为 0。
+- 这说明新路径正在稳定出帧，且最短间隔移除后显示时延目前约 45–54ms（从 capture callback 算）。跨重启的场景和负载会变动；还应在同一场景切到“按检测节奏限速”做 A/B，才能把变化归因到 pacing。
+- 用户在同一进程、同一场景连续切换后，00:36:08–00:37:08 尽快呈现 vs 00:37:08–00:38:08 按检测节奏限速：两段状态帧率都约 58–60fps。尽快呈现的插值帧 callback→display 为 44.4/51.8ms，限速为 48.0/48.6ms；采集帧为 52.7/60.1ms vs 64.7/65.3ms。采集帧 GPU完成→显示从 40.1/44.2ms 降至 28.6/32.0ms。provider 两段约 22ms，呈现队列等待均近 0；结果支持尽快呈现缩短了显示端排队，采集帧收益最大，插值帧 P95 有约 3ms 回摆。
+
+## 2026-09-28：移除代理插帧后的同步 1080p→4K 放大
+
+- 原路径在 Apple 产出 1920×1080 中间帧后，再经独立 Metal command buffer 放大到 3840×2160，并同步等待 GPU；实际显示时又由 Metal renderer 把像素缓冲采样到全尺寸 drawable。这多做了一次分配、缩放和 GPU 同步。
+- 改为直接把 Apple 的 1920×1080 NV12 中间帧交给 renderer，由 renderer 在 4K drawable 上显示；4K 采集帧本身不缩小，显示层/drawable 也不降分辨率。此项只移除合成中间帧上的冗余放大缓冲，`preprocess` 指标现在只覆盖两张输入帧的 4K→1080p 缩放。
+- 插帧中间帧仍只有 1080p 源细节，显示时使用 renderer 现有的线性采样；截图遇到 1080p 插帧缓冲时用 Lanczos 延展回 4K PNG 尺寸。
+- 尚待 release 构建与实机 A/B：重点比较 provider/preprocess P50/P95、插值帧 callback→display、帧率，并检查快速转镜头时中间帧的锐度。当前运行实例不受此源码修改影响，重启新版后才可测。
+- 用户在同一画面主观比较两种呈现方式后反馈：按检测节奏限速明显比尽快呈现顺滑。尽快呈现的最低时延并不保证帧间隔均匀，故后续默认改回按检测节奏限速，菜单保留即时切换用于实机对照。
+- Release 构建成功，更新已安装并通过严格签名校验；旧包保存在 `Artifacts/SwitchViewer-proxy-before-20260928.app`。PID 81693 未被中断，仍运行旧代码；退出并重开后才会启用这次缩放路径与按节奏默认值。安装包为 ad-hoc 签名，代码哈希变化后 macOS 可能再次请求相机/麦克风权限。
+
+## 2026-09-28：直接显示 1080p 插值缓冲实机结果
+
+- 用户重开后，新进程日志确认 backend 为“4K输入→1080p代理，4K窗口显示”，呈现策略为按检测节奏限速；采集仍是 UGREEN 95348 的 3840×2160 NV12@60，游戏节奏约 30fps。
+- 取 02:19:46–02:20:53 的 23 个处理窗口：预处理 P50/P95 的跨窗口中位数为 5.2/7.2ms，Apple 处理 15.9/17.3ms，provider 总计 20.2/24.0ms，capture-to-ready 21.8/25.2ms，处理队列 0.3/0.5ms。旧路径在 01:52 左右的预处理为 8.8/12.1ms、provider 约 22.2/27.5ms；时段和负载不同，只作方向性比较，不能当成严格同场 A/B。
+- 同一新版本窗口中，插值帧 callback→display 为 46.9/47.7ms、PTS→display 约 84.0/84.0ms；采集帧分别为 63.5/64.4ms、约 84.0/84.0ms。02:20:42 定时状态为 60fps，插帧/Metal 渲染失败均为 0。
+- 02:19:23 采集设备曾短暂断连，02:19:36 检测到重连并重新启动采集；该段累计造成 114 次输入队列淘汰。到 02:20:12 后这一计数保持不变，之后至 02:20:42 呈现限额丢帧只增加 4 次，流已恢复稳定。不要把断连瞬间的 37fps 状态当成持续性能。
+
+## 2026-09-28：复用 Apple 4K 代理的缩放输入帧
+
+- Apple 4K 代理插帧每轮会分别把前后两张 3840×2160 NV12 输入缩到 1920×1080，而且每次 Metal 缩放都会同步等待 GPU。连续游戏帧的上一张输入，通常正是上一轮已经缩好的当前帧。
+- 增加最多 4 张的代理缓冲 LRU 缓存，以媒体时间戳查找，缓存只保留 1080p 像素缓冲，不持有原始 4K 采集缓冲。时间戳倒退时清空缓存；无效时间戳不缓存。常见稳态预计每轮从两次缩放降为一次，日志新增 `proxyCache=命中数/未命中数` 用来核实实际命中率。
+- Release 构建成功，新的 `SwitchViewer.app` 已安装并通过严格签名校验；替换前的 app bundle 保存在 `Artifacts/SwitchViewer-running-old-proxy-cache-20260928.app`。进程 PID 82786 是替换前启动的旧实例，仍在运行，因此新缓存尚未实测；退出并重新打开后，比较 `preprocess`、`provider`、`captureToReady` 和 `proxyCache` 日志。
+
+## 2026-09-28：采集回调优先级与交付时延测量
+
+- 当前进程的 20 个三秒窗口显示，采集时间戳到上屏与采集回调到上屏的 P50 差约 28ms；但此前没有逐帧记录“采集 PTS→delegate 回调”，无法判断这段差值在 CoreMediaIO 交付还是样本处理。
+- 将 `AVCaptureVideoDataOutput` delegate 使用的串行 `framesQueue` 提升到 `.userInteractive`，并新增每三秒的 `ptsToCallback` 与 `callbackWork` P50/P95 统计。插帧算法、输入尺寸、呈现队列和按节奏 pacing 均未改。
+- Release 构建成功，新版 app 已安装并通过严格签名校验。PID 84403 仍运行缓存版旧代码；退出并重开后检查启动日志中的 `captureCallbackQueueQoS=userInteractive`，再比较 PTS→回调、回调处理耗时以及 callback→display。更新前 app bundle 保存在 `Artifacts/SwitchViewer-running-pre-capture-qos-20260928.app`。
+
+## 2026-09-28：拆分代理缩放与插帧计时
+
+- 保持插帧与上屏行为不变，为每次 4K→1080p NV12 缩放增加 command buffer 编码 CPU、提交到 GPU 开始、GPU 执行、提交到完成及 resize 总墙钟计时。当前 scaler 每次只提交 resize 命令，因此这一阶段的 `resizeGPU` 对应 resize command buffer 的 GPU 执行区间。
+- 插帧日志新增 `interpolationSubmitToReady`，与 `resizeWall` 分开；cache 命中不伪造 resize 计时，按每个 3 秒窗口的 P50/P95 报告各阶段数据。
+- `swift build -c release` 通过。尚未重启实时采集进程，新指标待新版运行后读取；此阶段只验证编译和计时接线，不据此声称性能已改善。
+
+## 2026-09-28：NV12Scaler command-buffer API
+
+- 将 `NV12Scaler` 和 Metal kernel 移至独立源文件，新增 `encodeScale(source:destination:into:)`。该 API 只校验像素格式、创建 Core Video Metal 纹理并编码 Y/UV compute work，不创建、提交或等待 command buffer。
+- 暂留 `scaleSynchronously` 适配器供当前实时路径使用，故本阶段不改变插帧和呈现行为。纹理包装对象由 command buffer 完成回调强引用到 GPU work 结束。
+- `swift build -c release` 通过；运行时 A/B 尚未执行。
+
+## 2026-09-28：4K 代理插帧异步化
+
+- 将 4K 代理路径改为提交式 API。代理缩放与 `VTFrameProcessor.process(with:parameters:)` 编入同一个 Metal command buffer，由完成回调交付结果；4K 代理实时路径不再调用 `waitUntilCompleted()` 或 semaphore 等待。
+- 新增单 active job 保护；job 强持有原始输入、代理像素缓冲、VT frame、parameters 和输出，直到 command buffer 完成。只在成功完成后把新代理帧放入 PTS cache。
+- 合并 command buffer 报错时，尝试 callback-driven fallback：独立异步缩放 command buffer 完成后，再调用 VideoToolbox 异步 completion-handler 接口。记录 fallback 次数。
+- `FrameInterpolationLab` 使用自身的同步探针包装器等待异步结果；这个等待仅在离线实验工具中，不进入 SwitchViewer 实时 4K 代理路径。
+- 合并路径的 `commandBufferGPU` 覆盖 resize 与 VT effect，不能解释成 resize-only GPU 时间。第一阶段的独立 resize 计时保留作改动前基线。Release 构建通过；尚未在实时采集卡场景运行，API 兼容性和 P50/P95/P99 变化待实机验证。
+
+## 2026-09-28：分离插帧回调的数据所有权
+
+- `FrameInterpolationCompletion` 不再把输入 source buffer 作为插帧结果返回。输入 source 由采集回调持有；插帧器只交付 midpoint、错误和帧间隔，避免调用方误把 source 生命周期/上屏决定交给插帧器。
+- 为保证这一阶段可运行，旧呈现策略暂由采集回调把自己持有的 source 传给原有配对适配器；上屏时机尚未改变，source 与 midpoint 的调度解耦留到下一阶段。
+- `swift build -c release` 通过；尚未运行实时 A/B。
+
+## 2026-09-28：按媒体时间戳调度 30→60 输出
+
+- 新增可切换的“按媒体时间戳定时（实验）”策略，默认仍是原呈现方式。仅当 4K Apple 代理插帧开启且 cadence detector 稳定识别约 30fps 时，source 才立即独立进入 scheduler；其他节奏继续走旧路径。离开稳定 30fps、切换模式/格式或关闭插帧时会重置 epoch 和待排时隙。
+- scheduler 按 source 与 midpoint 的媒体 host time 合并到同一 60Hz slot；完全相同的重复 source 可由准时 midpoint 顶替，任何 NV12 像素变化（包括 HUD/UI）都保留 source 优先。重复 source 已经显示后会保持现有 drawable，不重复重画；midpoint 错过 ready deadline 会被丢弃，尚未显示的 source 可及时顶上。
+- 呈现目标用 `present(drawable, atTime:)`，Dispatch timer 在 target 前按观测到的 renderer P99 lead 和 scheduler wake P99 加动态安全量唤醒；不会忙等，也不会提前占住 drawable。初始 playout delay 为 95ms，再依据 ready 相对 midpoint PTS 的 P99 逐步上调/缓慢收敛。
+- 新增 scheduler slot、midpoint late-by P50/P95/P99、source fallback、source 优先覆盖、完整 NV12 对比、playout delay、renderer lead、timer lateness 和动态 safety 诊断。上屏分段日志现在输出 P50/P95/P99 与 target-to-presented。
+- 此阶段仍用异步完整 NV12 比较来严格判断重复帧；高分辨率比较的成本尚待观测，后续签名采样阶段再评估替换。`swift build -c release` 通过；默认行为未切换，真实采集场景 A/B 尚未完成。
+
+## 2026-09-28：用 Y/UV 显示签名替换整帧比较
+
+- 扩展 `SwitchFrameCadenceDetector` 的一次 NV12 只读锁：同一访问同时生成 cadence 128×72 luma、显示 Y 256×144 和交错 UV 128×72 样本。采集侧将这个签名传给插帧器，cadence detector 复用其中的 luma 样本，不再为 cadence 单独锁缓冲。
+- scheduler 与旧呈现适配路径均改为比较签名；删除实时 4K NV12 两平面的整帧 `memcmp`。signature 相同的重复捕获在 scheduler 中复用上一内容缓冲，避免为重复帧保留额外的 4K IOSurface。渲染和颜色转换路径未变。
+- 诊断新增 signature 采样时长、signature 比较 P50/P95/P99、比较次数和重复命中数；采集 callbackWork 与 PTS→callback 同时扩展到 P99。
+- 签名只覆盖采样点，Y/UV 签名相同不等于每个像素都相同；很小或刚好落在采样点之间的 HUD/UI 变化仍可能被漏掉。该风险需要用静态场景与 60Hz HUD 实机检查；P95/P99 和实际命中率也尚无硬件数据。
+- `swift build -c release` 通过，`FrameInterpolationLab` 也随构建成功。实时采集 A/B 未执行；deadline 策略仍是菜单实验项，默认 pacing 未更改。
+
+## 2026-09-28：deadline playout 初值与节奏失锁迟滞
+
+- 另一 session 的审计核实了核心因果链：目标时间是媒体 PTS 加 playout delay；完整 scheduler reset 会清空估计并恢复 95ms；每帧节奏识别结果为 unknown 时，旧逻辑立即增加 epoch、取消待排 slot 和在途插值结果。异步 VT 路径保留 command-buffer completion，没有发现实时路径上的同步 wait。
+- 同一实验版在切到 deadline 前的短基线（20:48:28–20:48:54）中，去掉启动首个异常窗口后，插值帧 callback→display 的 3 秒窗口 P50/P95 中位数为 41.1/49.2ms（5 窗口），采集帧为 57.5/58.1ms（7 窗口）。21:02:55–21:03:22 的实验模式分别为 48.0/56.1ms、64.8/73.7ms（各 10 窗口）。时间段和内容并非严格锁定的即时 A/B，但未显示时延下降，符合 reset/95ms 目标偏保守的判断。
+- 完整 reset 的 playout 初值从 95ms 降至 75ms；现有 ready-time P99 估计仍可按实测需要上调。30fps 检测短暂 unknown 时保留 scheduler 路由最多 18 个连续采集样本（约 300ms），期间照常排 source slot；检测器没有给出有效 cadence 时不会生成 midpoint。若 unknown 持续到阈值，或明确识别到其他游戏节奏，再取消 pending slot/更换 epoch，并保留已学到的 playout、renderer lead 和 wake timing；格式、模式或采集会话重配仍执行完整清理。
+- Release 构建通过；只有原有 AVCaptureDevice.devices(for:) 弃用警告。新包 `.build/SwitchViewer-Deadline-Experiment-v2.app` 独立打包并通过严格签名校验，未替换或重启仍在运行的 v1。v2 硬件 A/B 尚待重开后执行；审计提出的 50–55ms 和 callback-anchored 调度未直接采用，需用中间帧迟到率和同场 A/B 验证其 tradeoff。
+
+## 2026-09-28：v2 VideoToolbox 崩溃与 scheduler 抖动加固
+
+- 用户提供的 v2 崩溃报告显示，运行约 36 分钟后，`VTFrameProcessor.processWithCommandBuffer:parameters:` 在 VideoToolbox 内因 `NSMutableArray insertObject:nil` 触发 `SIGABRT`。崩溃前 4K60、30fps 代理插帧、Metal 与渲染指标正常；报告不能证明 VideoToolbox 收到的具体内部对象为何为 nil，也没有证据把崩溃归因给 deadline scheduler。
+- 单改回“按检测节奏限速”不能避开该调用：旧节奏和 deadline 节奏共用 4K 代理插帧器；之前的异步实现也走同一个 `process(with:parameters:)` selector。为避开已知崩溃入口，代理缩放 command buffer 先完成，再调用 VideoToolbox 的独立异步 completion-handler 接口；另加非递增、无效或间隔大于等于 1 秒的时间戳检查，遇到时跳过插值并记录 PTS。
+- v2 长跑日志还显示 cadence unknown/30fps 反复切换，在约 2.5 分钟内发生 5 次 scheduler reset，含 4 秒内 3 次的簇。unknown 宽限增至 60 个采集样本，并要求连续 8 帧识别为 30fps 才重新启用 scheduler。
+- `swift build -c release` 成功；只见现有 AVFoundation 与 FrameInterpolationLab 的弃用警告。独立 v3 app `.build/SwitchViewer-Deadline-Experiment-v3.app` 已通过 strict signature 校验。当前未连接实机长跑验证；接下来重点观察崩溃是否消失、`separateProcessorSubmission` 耗时与 cadence reset 频率。
+
+## 2026-09-30：屏幕捕获来源（ScreenCaptureKit）与通用代理插帧
+
+- 菜单新增“画面来源”，可在采集卡与屏幕捕获之间切换；屏幕捕获可选任意显示器或单个窗口。窗口捕获用 `SCContentFilter(desktopIndependentWindow:)`（被遮挡也能抓）；显示器捕获会排除 SwitchViewer 自己的窗口，避免把预览画面抓回去形成回环。新增 `Sources/SwitchViewer/ScreenCaptureSource.swift`。
+- 帧入口重构：原属 `AVCaptureVideoDataOutput` 的 `captureOutput` 主体拆成与来源无关的 `handleVideoFrame(pixelBuffer:presentationTimeStamp:captureCallbackHostTime:presentationTimestampHostTime:)`，采集卡与屏幕捕获共用同一条节奏检测→插帧→呈现链路。`hostTime(forCaptureTimestamp:)` 按来源分支：采集卡走 `session.synchronizationClock`，屏幕捕获直接用 host clock（实测 ScreenCaptureKit 的 PTS 本身就在 host 时钟域，回调时 age 约 0.4ms）。
+- `ScreenCaptureSource` 请求 `420v` NV12、`queueDepth=3`、`minimumFrameInterval=1/60`。独立测试程序实测：显示器捕获稳定输出 3024×1964 420v 且带 IOSurface，窗口捕获 1360×1058，两者都是约 60Hz 回调栅格、PTS 单调递增，判定 PASS。
+- 为保持与采集卡一致的“固定栅格 + 重复帧”契约，窗口捕获里 `SCFrameStatusIdle`（内容未变化、不带像素缓冲）的 tick 会用上一张缓冲重放，因此既有的 `SwitchFrameCadenceDetector` 不需要改动。显示器捕获不产生 idle tick，重复帧仍由像素签名比较识别，与采集卡相同。
+- `AppleDownsampledFrameInterpolator` 从写死 4K 输入改为接受任意输入：在 1080p→720p→576p 中取“不超过输入尺寸的最大档位”作为代理；输入本身已是受支持档位时不再缩放，直接交给 VideoToolbox。离线验证（本机 M5）：3840×2160→1920×1080 缩放 16.4ms、3024×1964→1920×1080 缩放 17.5ms、1360×1058→1280×720 缩放 7.7ms、1280×720 原样直通 4.4ms、1024×576 原样直通 2.6ms、640×360 在初始化阶段即以明确错误拒绝。4K 采集卡路径行为与改动前一致。
+- 新增 `AppleLowLatencyProxySize`，把“Apple 低延迟插帧实际只接受 576p/720p/1080p”这一实测结论固化进代码：文档给的 `maximumDimension`/`maximumPixelCount`（本机 1920 与 2073600）只是必要条件，1600×900、1440×1080 等满足文档条件仍会在 process 阶段报 `VTFrameProcessorProcessingError (-19740)`。插帧方式菜单里的“4K代理”更名为“代理缩放”，同一项现在同时适用于采集卡与屏幕捕获。
+- 帧代次管理统一为 `beginNewSourceGeneration(reason:)`，采集卡会话与屏幕捕获互相切换时都会推进 epoch 并重置统计，避免旧来源的帧在新来源下上屏；任何采集卡菜单操作都隐含切回采集卡。
+- `swift build -c release --disable-sandbox` 通过（只剩既有的 `AVCaptureDevice.devices(for:)` 弃用警告）。`SwitchViewer.app` 已更新并通过严格签名校验，替换前的二进制保存在 `Artifacts/SwitchViewer-pre-screen-source-20260930`。启动日志新增 `屏幕捕获权限; granted=…` 与 `开始新的画面来源代次; …`，已确认新版能正常启动。
+- 边界与未验证项：SwitchViewer 自身尚未获得“屏幕录制”权限，来源菜单会显示“申请屏幕录制权限…”；授权后需重新打开 app，且因为是 ad-hoc 签名，重新构建改变签名哈希后可能要再次授权。本次只验证到“ScreenCaptureSource 能拿到正确的 420v/IOSurface 缓冲”和“代理插帧在任意输入尺寸下的行为”，菜单切到屏幕捕获后的端到端观感、延迟与长时间稳定性尚未实机确认。
+
+## 2026-09-30：屏幕捕获插帧联调，查出缓冲池耗尽缺陷
+
+- 目标：在真实来源上跑通“屏幕捕获 → 下采样 → Apple 插帧 → 上采样”。被测目标是《鸣潮》（Unity，`com.kurogame.mingchao`），同时用合成 30Hz 窗口与桌面做对照。
+- **缺陷（已修）**：`SCStreamConfiguration.queueDepth` 原设 3，而插帧链路会同时持有约 9 张源帧——节奏检测 `recentCaptureFrames` 3 张、待处理队列最多 2 张、`latestSubmission` 1 张、正在插值的 previous/current 2 张、屏幕来源 `lastPixelBuffer` 1 张。ScreenCaptureKit 的缓冲池因此被耗尽，表现为**投递 4 帧后彻底静默、且不报任何错误**：`screenDelivered=4`、`SCStreamDelegate.didStopWithError` 不触发、`lastFrame` 冻结、`sample` 里没有任何线程阻塞在锁或信号量上。只在开启插帧时复现；同一路显示器捕获关闭插帧时稳定 57.5fps、852 帧。队列深度改为 12 后连续 75 秒稳定：`screenDelivered=3407`、`frames=4933`、`interpolatedFrames=1539`、`interpolationFailures=0`、`renderError=无`、`lastFrame=0.0s`。
+- 排查过程中值得记住的一点：独立进程里 `AppleDownsampledFrameInterpolator` 在 3024×1964 上连续 150 次提交，P50 13.0ms、P95 15.3ms、无停顿，所以插帧器本身没问题；只有在 app 内把来源计数打出来之后，才定位到回调在源头就停止了。
+- 稳态性能（3024×1964 显示器捕获 → 1920×1080 代理，桌面静态场景）：`provider` 与 `interpolationSubmitToReady` 同为 P50/P95 12.4/17.3ms；`proxyEncodeCPU` 0.2/0.3ms、`commandBufferGPU` 1.2/5.9ms；`proxyCache` 约 50% 命中（173/173）。采集侧 `ptsToCallback` 仅 0.1/0.3ms、`signatureSampling` 0.3/2.7ms、`callbackWork` 0.3/2.8ms。上屏：插值帧 callback→display 37.1/43.6ms、采集帧 43.0/53.1ms，其中 `gpuCompleteToDisplay` 20.5–26.8ms 是最大单项。与采集卡 4K 代理路径相比，屏幕捕获省掉了采集卡自身的交付延迟（`ptsToCallback` 从约 28ms 量级降到 0.1–0.3ms），但上屏段仍是大头。
+- **真实游戏的阻塞点**：《鸣潮》全屏后会进入自己的 Space。`SCShareableContent` 的 on-screen 过滤看不到它，把列举与启动都改成 `onScreenWindowsOnly: false` 之后才能列出该窗口；但即便如此，ScreenCaptureKit 也投递 0 个缓冲——游戏在非前台 Space 时不再绘制，没有画面可插。独立探针复核：窗口列举正常、`capturedSize=3024×1898`、6 秒内 `buffers delivered: 0`。结论：在 macOS 上要对游戏做这条链路，游戏必须处于可见状态（窗口/无边框模式）；全屏独占 Space 不可用，即便能捕获到也无法把预览窗盖到那个 Space 上。
+- 顺带修复的可用性问题：`app:` 目标原先是对“应用名 — 标题”整串匹配，`app:鸣潮` 会命中标题含“鸣潮”的 Safari 窗口；现在 `app:` 只匹配应用名、`title:` 只匹配标题，多个同尺寸窗口取面积最大者，失败过的窗口 ID 会被排除后重试（游戏启动期的临时窗口会在列举与启动之间失效，且列举与启动必须使用同一组 `onScreenWindowsOnly` 参数，否则目标永远找不到）。
+- 顺带补齐的诊断：`ScreenCaptureSource.SourceError` 与 `AppleDownsampledFrameInterpolator.InterpolationError` 之前只实现 `CustomStringConvertible`，日志里只会打印“错误4”这类无意义文本，已同时实现 `LocalizedError`；定时状态新增 `source=`、`screenDelivered/screenReplayed/screenEmptyCallback`；屏幕来源的 `didStopWithError` 现在也写入诊断日志（此前只更新状态栏，“流静默停止”完全不可见）。
+- 新增可自动化入口：`--screen-target=display:first|display:<id>|app:<名称>|title:<标题>`、`--enable-interpolation`、`--interpolation-mode=<值>`、`--request-screen-permission`、`--click-through`，以及 `SWITCHVIEWER_LOG_DIR` 覆盖日志目录。窗口菜单新增“鼠标穿透（盖在游戏上时开启）”，开启时自动置顶——没有它预览窗会吞掉游戏的鼠标输入。
+- 未验证：真实游戏画面（30fps 内容）下的节奏识别与插帧画质。本次受限于游戏无法在可见状态下运行，只验证了静态桌面场景下的全链路正确性与性能。
+
+### 后续验证与修正（2026-09-30）
+
+- 上述“全屏独占 Space 不可用”是早期非前台 Space 测试的结论，不能作为 ScreenCaptureKit 的普遍限制。后续通过不获取焦点的游戏操作浮窗，保持游戏为前台应用，已验证游戏捕获与显示；游戏未绘制时仍不能生成新的源画面。
+- 屏幕来源现按独立内容更新时间戳配对和定时显示，不再使用采集卡的固定重复周期识别。测试范围及计数定义见 `screen-content-timing.md`。
+- 默认屏幕捕获在当前广色域显示器上出现颜色变淡；串行单帧对比中，仅明确指定捕获色彩空间为 sRGB 就明显纠正静态头像的色度偏差。捕获输出与 Metal 显示层现均明确使用 sRGB。先前使用明确 sRGB 转换的 RGB 离线模拟未覆盖该默认捕获行为。
