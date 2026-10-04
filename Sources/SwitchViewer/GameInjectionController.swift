@@ -1,5 +1,4 @@
 import AppKit
-import UniformTypeIdentifiers
 import SwitchViewerInterpolation
 import SwitchViewerGamePlugins
 
@@ -160,7 +159,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
 
     func startGame(pluginID: String, appURL: URL? = nil,
                    openURL: (URL) -> Bool = { NSWorkspace.shared.open($0) }) {
-        guard let plugin = GamePluginRegistry.builtIn.plugin(id: pluginID) else {
+        guard let plugin = gamePlugins.first(where: { $0.descriptor.id == pluginID }) else {
             update("找不到该游戏插件，请重新选择。"); return
         }
         let installed = appURL ?? GamePluginRegistry.builtIn.installedApplication(for: plugin,
@@ -172,7 +171,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
               FileManager.default.isExecutableFile(atPath: executable.path) else {
             let opened = plugin.descriptor.installationURLs.contains { openURL($0) }
             if plugin.descriptor.installationURLs.isEmpty {
-                update("未找到 \(plugin.descriptor.name)，请通过“选择其他 Mac 游戏”指定应用。")
+                update("未找到 \(plugin.descriptor.name)，请安装游戏后重新启动。")
             } else {
                 update(opened ? "未找到 \(plugin.descriptor.name)，已打开 App Store。安装完成后，回到这里启动游戏。"
                     : "未找到 \(plugin.descriptor.name)，无法打开 App Store，请在商店搜索并安装。")
@@ -180,22 +179,6 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
             return
         }
         launch(appURL: installed, plugin: plugin)
-    }
-
-    func launchGameApplication(_ url: URL) {
-        let application = GameApplication(bundleIdentifier: Bundle(url: url)?.bundleIdentifier, url: url)
-        launch(appURL: url, plugin: GamePluginRegistry.builtIn.plugin(for: application))
-    }
-
-    @objc func chooseGame() {
-        let picker = NSOpenPanel()
-        picker.allowedContentTypes = [.applicationBundle]
-        picker.canChooseDirectories = false
-        picker.allowsMultipleSelection = false
-        picker.directoryURL = URL(fileURLWithPath: "/Applications")
-        picker.begin { [weak self] result in
-            if result == .OK, let url = picker.url { self?.launchGameApplication(url) }
-        }
     }
 
     @objc func startFixture() {
@@ -206,7 +189,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private func launch(appURL: URL, plugin: any GameIntegrationPlugin) {
         guard let bundle = Bundle(url: appURL), let executable = bundle.executableURL,
               FileManager.default.isExecutableFile(atPath: executable.path) else {
-            update("找不到有效的游戏应用，请通过“选择其他 Mac 游戏”重新选择。"); return
+            update("找不到有效的游戏应用，请检查安装位置后重新启动。"); return
         }
         if let identifier = bundle.bundleIdentifier,
            !NSRunningApplication.runningApplications(withBundleIdentifier: identifier).isEmpty {

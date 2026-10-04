@@ -89,8 +89,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
             button.toolTip = "启动 \(plugin.descriptor.name)；未安装时显示安装入口"
             return button
         }
-        let genericLauncher = action("选择其他 Mac 游戏", #selector(chooseGame))
-        gameLaunchers = pluginLaunchers + [genericLauncher]
+        gameLaunchers = pluginLaunchers
         let gamePage = column([NSTextField(labelWithString: "选择游戏，启动后自动进入插帧面板。")]
             + gameLaunchers)
         let screenView = column([row("窗口 / 屏幕", screenPicker)])
@@ -487,7 +486,6 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         }
         refresh()
     }
-    @objc private func chooseGame() { owner?.gameInjectionController.chooseGame() }
     @objc private func toggleGameInterpolation() { owner?.gameInjectionController.toggleGameInterpolation(); refresh() }
     @objc private func recordGameFrames() { owner?.gameInjectionController.recordGameFrames(); refresh() }
     @objc private func showPreview() { owner?.showPreview() }

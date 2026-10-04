@@ -149,9 +149,16 @@ struct WorkflowCheck {
         expect(owner.gameInjectionController.status.contains("无法打开 App Store"), "failed store opening leaves manual installation guidance")
         owner.gameInjectionController.startGame(pluginID: "unknown-plugin") { urls.append($0); return true }
         expect(owner.gameInjectionController.status.contains("找不到该游戏插件"), "unknown game plugin never launches a target")
-        owner.gameInjectionController.launchGameApplication(missing)
-        expect(owner.gameInjectionController.status.contains("找不到有效的游戏应用")
-            && !owner.gameInjectionController.status.contains("鸣潮"), "generic launch errors never assume Wuwa")
+        urls.removeAll()
+        owner.gameInjectionController.startGame(pluginID: "generic-metal") { urls.append($0); return true }
+        expect(owner.gameInjectionController.status.contains("找不到该游戏插件")
+            && !owner.gameInjectionController.isGameRunning && urls.isEmpty,
+            "diagnostic generic plugin cannot launch a user-selected game")
+        let view = ViewerSettingsView(owner: owner, discoverVideoDevices: { [] })
+        let buttons = descendants(view).compactMap { $0 as? NSButton }
+        expect(!buttons.contains { $0.title == "选择其他 Mac 游戏" }
+            && buttons.contains { $0.identifier?.rawValue == "wuthering-waves" },
+            "game selection only exposes registered game plugins")
     }
     static func click(_ title: String) {
         let control = button(title)
