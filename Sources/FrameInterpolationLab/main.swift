@@ -597,6 +597,22 @@ private func writeProbeImage(_ buffer: CVPixelBuffer, path: String) throws -> UR
 do {
     let args = Array(CommandLine.arguments.dropFirst())
     let arguments = Set(args)
+    if let input = args.first(where: { $0.hasPrefix("--multiframe-replay=") }) {
+        let path = String(input.split(separator: "=", maxSplits: 1).last!)
+        let output = args.first(where: { $0.hasPrefix("--multiframe-output=") })?.split(separator: "=", maxSplits: 1).last.map(String.init) ?? "Artifacts/multiframe-replay.json"
+        try runMultiFramePlayoutReplay(inputPath: path, outputPath: output)
+        exit(0)
+    }
+    if let input = args.first(where: { $0.hasPrefix("--multiframe-probe=") }) {
+        let path = String(input.split(separator: "=", maxSplits: 1).last!)
+        let output = args.first(where: { $0.hasPrefix("--multiframe-output=") })?.split(separator: "=", maxSplits: 1).last.map(String.init) ?? "Artifacts/multiframe-probe.json"
+        let samples = Int(args.first(where: { $0.hasPrefix("--multiframe-samples=") })?.split(separator: "=", maxSplits: 1).last ?? "90") ?? 90
+        guard samples >= 10 && samples <= 500 else { throw NSError(domain: "MultiFrameProbe.SampleCount", code: samples) }
+        let stride = Int(args.first(where: { $0.hasPrefix("--multiframe-stride=") })?.split(separator: "=", maxSplits: 1).last ?? "1") ?? 1
+        guard stride >= 1 && stride <= 4 else { throw NSError(domain: "MultiFrameProbe.InputStride", code: stride) }
+        try runMultiFrameProbe(clipPath: path, outputPath: output, sampleCount: samples, inputStride: stride)
+        exit(0)
+    }
     if let probeArgument = args.first(where: { $0.hasPrefix("--apple-downsample-probe=") }) {
         let path = String(probeArgument.split(separator: "=", maxSplits: 1).last ?? "")
         let framePair = args.first(where: { $0.hasPrefix("--apple-downsample-frames=") })?
