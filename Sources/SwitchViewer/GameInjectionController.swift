@@ -31,6 +31,9 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
 
     private var supportsMovieControl = false
     private var movieRequest: DispatchWorkItem?
+    private var movieArchivePending = false
+    private var movieArchiveRoot = ComparisonMovieRecorder.recordingsDirectory()
+    var onComparisonRecordingSettled: (() -> Void)?
     private(set) var isComparisonRecording = false
     private(set) var comparisonRecordingBusy = false
     private(set) var comparisonRecordingStatus = ""
@@ -54,6 +57,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
             guard let self, !self.isComparisonRecording else { return }
             self.comparisonRecordingStatus = "游戏未响应录制请求，请重启游戏后重试"
             self.comparisonRecordingBusy = false
+            self.onComparisonRecordingSettled?()
             // A late begin acknowledgement restores the actual recording state.
         }
         movieRequest = request
@@ -73,6 +77,32 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         } else if line.contains("MOVIE_RECORD finishing") {
             isComparisonRecording = false
             comparisonRecordingStatus = "正在保存…"
+        } else if line.contains("MOVIE_RECORD end"), let path = decoded("path") {
+            isComparisonRecording = false
+            comparisonRecordingBusy = true
+            comparisonRecordingStatus = "正在转移到素材目录…"
+            movieArchivePending = true
+            let source = URL(fileURLWithPath: path), root = movieArchiveRoot
+            comparisonRecordingDirectory = source
+            DispatchQueue.global(qos: .utility).async { [self] in
+                let result = Result { try ComparisonRecordingArchive.transfer(from: source, to: root) }
+                DispatchQueue.main.async { [self] in
+                    movieArchivePending = false
+                    comparisonRecordingBusy = false
+                    switch result {
+                    case .success(let saved):
+                        comparisonRecordingDirectory = saved.directory
+                        comparisonRecordingStatus = saved.cleanupError == nil ? "两路素材已保存"
+                            : "两路素材已保存；游戏内临时副本清理失败"
+                    case .failure(let error):
+                        comparisonRecordingStatus = "素材已录好，转移失败，原文件已保留：" + error.localizedDescription
+                    }
+                    toolbar?.refreshConfiguration()
+                    onComparisonRecordingSettled?()
+                }
+            }
+            toolbar?.refreshConfiguration()
+            return
         } else {
             isComparisonRecording = false
             comparisonRecordingBusy = false
@@ -81,6 +111,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         }
         if let path = decoded("path") { comparisonRecordingDirectory = URL(fileURLWithPath: path) }
         toolbar?.refreshConfiguration()
+        if !comparisonRecordingBusy { onComparisonRecordingSettled?() }
     }
 
     func toggleGameInterpolation() {
@@ -273,6 +304,10 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         if executable.lastPathComponent == "GameHookFixture" {
             environment["SWITCHVIEWER_COMPARISON_RECORDING_ROOT"] = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
                 .appendingPathComponent(".build/workflow-movies").path
+            movieArchiveRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(".build/workflow-movies-export")
+        } else {
+            movieArchiveRoot = ComparisonMovieRecorder.recordingsDirectory()
         }
         child.environment = environment
         let logDirectory = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
@@ -298,6 +333,10 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
                 let state = child.terminationStatus
                 let wasLoaded = self.loaded
                 let wasStopped = self.requestedStop
+                // Drain the final acknowledgement before discarding the log.
+                while let data = try? self.logReader?.read(upToCount: 65_536), !data.isEmpty {
+                    self.consume(String(decoding: data, as: UTF8.self))
+                }
                 self.finish()
                 self.update(state == 0 || wasStopped ? "游戏已退出。" :
                     "游戏已退出（状态 \(state)）。\(wasLoaded ? "插帧库已加载，但未完成兼容性验证。" : "未确认加载成功，可能被系统或游戏保护阻止。")")
@@ -405,9 +444,9 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private func finish() {
         movieRequest?.cancel()
         supportsMovieControl = false
-        if comparisonRecordingBusy { comparisonRecordingStatus = "游戏退出前未确认录制保存，请检查素材目录" }
+        if comparisonRecordingBusy && !movieArchivePending { comparisonRecordingStatus = "游戏退出前未确认录制保存，请检查素材目录" }
         isComparisonRecording = false
-        comparisonRecordingBusy = false
+        comparisonRecordingBusy = movieArchivePending
         traceRequest?.cancel()
         traceRequestPending = false
         supportsTraceControl = false
@@ -430,6 +469,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         runningGameName = nil
         synchronizeWorkflow()
         toolbar?.resetMetrics()
+        if !comparisonRecordingBusy { onComparisonRecordingSettled?() }
     }
     @objc func stopGame() {
         guard !comparisonRecordingBusy else {

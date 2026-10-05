@@ -30,10 +30,15 @@ extension AppDelegate {
         if waitingForRecordingTermination {
             switch event {
             case .finished, .failed:
-                waitingForRecordingTermination = false
-                NSApp.reply(toApplicationShouldTerminate: true)
+                finishRecordingTerminationIfReady()
             default: break
             }
         }
+    }
+    func finishRecordingTerminationIfReady() {
+        guard waitingForRecordingTermination, !comparisonRecorder.isBusy,
+              !gameInjectionController.comparisonRecordingBusy else { return }
+        waitingForRecordingTermination = false
+        NSApp.reply(toApplicationShouldTerminate: true)
     }
 }

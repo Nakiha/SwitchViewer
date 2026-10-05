@@ -300,6 +300,10 @@ struct WorkflowCheck {
             }
             expect(owner.gameInjectionController.comparisonRecordingStatus == "两路素材已保存", "paired game recording finishes both movies")
             let folder = owner.gameInjectionController.comparisonRecordingDirectory!
+            expect(folder.deletingLastPathComponent().lastPathComponent == "workflow-movies-export", "game movie is exported to launcher directory")
+            let privateFolder = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(".build/workflow-movies").appendingPathComponent(folder.lastPathComponent)
+            expect(!FileManager.default.fileExists(atPath: privateFolder.path), "game movie temporary copy is cleaned after export")
             let data = try! Data(contentsOf: folder.appendingPathComponent("recording.json"))
             let json = try! JSONSerialization.jsonObject(with: data) as! [String: Any]
             let tracks = json["tracks"] as! [String: [String: Int]]

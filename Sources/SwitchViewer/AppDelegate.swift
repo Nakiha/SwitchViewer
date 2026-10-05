@@ -111,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         controller.onWillLaunch = { [weak self] in
             if self?.hasSelectedSource == true { self?.stopCapture() }
         }
+        controller.onComparisonRecordingSettled = { [weak self] in self?.finishRecordingTerminationIfReady() }
         return controller
     }()
     var autoCropScreenCapture = UserDefaults.standard.object(forKey: "autoCropScreenCapture") as? Bool ?? true
@@ -269,9 +270,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard comparisonRecorder.isBusy else { return .terminateNow }
+        guard comparisonRecorder.isBusy || gameInjectionController.comparisonRecordingBusy else { return .terminateNow }
         waitingForRecordingTermination = true
-        comparisonRecorder.stop()
+        if comparisonRecorder.isBusy { comparisonRecorder.stop() }
+        if gameInjectionController.isComparisonRecording { gameInjectionController.toggleComparisonRecording() }
         return .terminateLater
     }
 
