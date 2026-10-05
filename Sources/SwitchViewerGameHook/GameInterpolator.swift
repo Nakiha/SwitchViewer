@@ -75,7 +75,7 @@ final class GameInterpolator {
         let root = ProcessInfo.processInfo.processName == "GameHookFixture"
             ? ProcessInfo.processInfo.environment["SWITCHVIEWER_COMPARISON_RECORDING_ROOT"].map { URL(fileURLWithPath: $0) }
             : nil
-        comparisonRecorder.start(root: root ?? ComparisonMovieRecorder.recordingsDirectory())
+        comparisonRecorder.start(root: root ?? ComparisonMovieRecorder.gameRecordingsDirectory())
     }
 
     private var lastAcceptedNativeRequest: Double = 0 // Protected by lock.

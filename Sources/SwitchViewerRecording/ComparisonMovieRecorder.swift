@@ -73,11 +73,18 @@ public final class ComparisonMovieRecorder {
     public var isBusy: Bool { lock.lock(); defer { lock.unlock() }; return busy }
     public var isRecording: Bool { lock.lock(); defer { lock.unlock() }; return accepting }
 
-    /// The sandboxed game uses its own writable Movies directory. The launcher
-    /// learns the actual location through the inherited log, never guesses it.
+    /// Capture runs in the host app and saves to the user's Movies directory.
     public static func recordingsDirectory() -> URL {
         URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Movies/SwitchViewer", isDirectory: true)
+    }
+    /// A sandbox's Movies entry can link outside its container. Keep game
+    /// recordings in its private Application Support directory instead.
+    /// The launcher learns the actual location from the recording event.
+    public static func gameRecordingsDirectory(
+        home: URL = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+    ) -> URL {
+        home.appendingPathComponent("Library/Application Support/SwitchViewer/Recordings", isDirectory: true)
     }
     public func start(root: URL = ComparisonMovieRecorder.recordingsDirectory(),
                       duration: Double = 30, width: Int = 1920, height: Int = 1080,

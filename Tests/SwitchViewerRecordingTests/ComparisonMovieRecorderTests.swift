@@ -148,4 +148,41 @@ final class ComparisonMovieRecorderTests: XCTestCase {
         XCTAssertFalse(recorder.isBusy)
     }
 
+    func testGameRecordingDoesNotFollowMoviesLinkOutsideContainer() async throws {
+        let base = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let home = base.appendingPathComponent("Container/Data")
+        let outside = base.appendingPathComponent("UserMovies")
+        defer { try? FileManager.default.removeItem(at: base) }
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: home.appendingPathComponent("Movies"),
+            withDestinationURL: outside)
+        let started = expectation(description: "started inside container")
+        let finished = expectation(description: "saved both tracks")
+        var folder: URL?
+        let recorder = ComparisonMovieRecorder { event in
+            switch event {
+            case .started(let url): folder = url; started.fulfill()
+            case .finished: finished.fulfill()
+            case .failed(let message): XCTFail(message); finished.fulfill()
+            default: break
+            }
+        }
+        recorder.start(root: ComparisonMovieRecorder.gameRecordingsDirectory(home: home),
+            duration: 5, width: 320, height: 180, hostTime: 1000)
+        await fulfillment(of: [started], timeout: 10)
+        let original = try buffer(40), generated = try buffer(180)
+        recorder.append(original, track: .original, hostTime: 1000.1)
+        recorder.append(generated, track: .processed, hostTime: 1000.1, generated: true)
+        recorder.stop(hostTime: 1000.2)
+        await fulfillment(of: [finished], timeout: 15)
+        let url = try XCTUnwrap(folder)
+        XCTAssertTrue(url.resolvingSymlinksInPath().path.hasPrefix(home.path + "/Library/"))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: outside.path), [])
+        let originalTimes = try await times(url.appendingPathComponent("original.mov"))
+        let processedTimes = try await times(url.appendingPathComponent("processed.mov"))
+        XCTAssertFalse(originalTimes.isEmpty)
+        XCTAssertFalse(processedTimes.isEmpty)
+    }
+
 }
