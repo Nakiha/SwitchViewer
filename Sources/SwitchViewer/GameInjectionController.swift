@@ -116,6 +116,16 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private var supportsMovieControl = false
     private var movieRequest: DispatchWorkItem?
     private var movieArchivePending = false
+    private let movieFolderAccess = GameRecordingFolderAccess()
+    private var failedMovieArchive: (source: URL, root: URL)? { didSet { savePendingArchive() } }
+    private(set) var recordingArchiveNeedsPermission = false { didSet { savePendingArchive() } }
+    private func savePendingArchive() {
+        if let failedMovieArchive {
+            UserDefaults.standard.set(["source": failedMovieArchive.source.path, "root": failedMovieArchive.root.path,
+                                       "needsPermission": recordingArchiveNeedsPermission], forKey: "pendingGameRecordingArchive")
+        } else { UserDefaults.standard.removeObject(forKey: "pendingGameRecordingArchive") }
+    }
+    var canRetryRecordingArchive: Bool { failedMovieArchive != nil && !comparisonRecordingBusy }
     private var movieArchiveRoot = ComparisonMovieRecorder.recordingsDirectory()
     var onComparisonRecordingSettled: (() -> Void)?
     private(set) var isComparisonRecording = false
@@ -123,7 +133,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private(set) var comparisonRecordingStatus = ""
     private(set) var comparisonRecordingDirectory: URL?
     var canRecordComparison: Bool {
-        isGameRunning && supportsMovieControl && isGameInterpolationEnabled && !comparisonRecordingBusy && !configurationRequestPending
+        isGameRunning && supportsMovieControl && isGameInterpolationEnabled && !comparisonRecordingBusy && !configurationRequestPending && failedMovieArchive == nil
     }
     func toggleComparisonRecording() {
         guard let process else { return }
@@ -163,29 +173,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
             comparisonRecordingStatus = "正在保存…"
         } else if line.contains("MOVIE_RECORD end"), let path = decoded("path") {
             isComparisonRecording = false
-            comparisonRecordingBusy = true
-            comparisonRecordingStatus = "正在转移到素材目录…"
-            movieArchivePending = true
-            let source = URL(fileURLWithPath: path), root = movieArchiveRoot
-            comparisonRecordingDirectory = source
-            DispatchQueue.global(qos: .utility).async { [self] in
-                let result = Result { try ComparisonRecordingArchive.transfer(from: source, to: root) }
-                DispatchQueue.main.async { [self] in
-                    movieArchivePending = false
-                    comparisonRecordingBusy = false
-                    switch result {
-                    case .success(let saved):
-                        comparisonRecordingDirectory = saved.directory
-                        comparisonRecordingStatus = saved.cleanupError == nil ? "两路素材已保存"
-                            : "两路素材已保存；游戏内临时副本清理失败"
-                    case .failure(let error):
-                        comparisonRecordingStatus = "素材已录好，转移失败，原文件已保留：" + error.localizedDescription
-                    }
-                    toolbar?.refreshConfiguration()
-                    onComparisonRecordingSettled?()
-                }
-            }
-            toolbar?.refreshConfiguration()
+            archiveMovie(from: URL(fileURLWithPath: path), to: movieArchiveRoot)
             return
         } else {
             isComparisonRecording = false
@@ -196,6 +184,66 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         if let path = decoded("path") { comparisonRecordingDirectory = URL(fileURLWithPath: path) }
         toolbar?.refreshConfiguration()
         if !comparisonRecordingBusy { onComparisonRecordingSettled?() }
+    }
+
+    private func archiveMovie(from source: URL, to root: URL, selectedAccess: URL? = nil) {
+        comparisonRecordingBusy = true
+        comparisonRecordingStatus = "正在转移到素材目录…"
+        movieArchivePending = true
+        recordingArchiveNeedsPermission = false
+        comparisonRecordingDirectory = source
+        let access = selectedAccess ?? movieFolderAccess.restoredAccess(for: source)
+        // Capture only this attempt's URL; another recording cannot replace it.
+        DispatchQueue.global(qos: .utility).async { [self] in
+            let scoped = access?.startAccessingSecurityScopedResource() ?? false
+            let result = Result { try ComparisonRecordingArchive.transfer(from: source, to: root) }
+            if scoped { access?.stopAccessingSecurityScopedResource() }
+            DispatchQueue.main.async { [self] in
+                movieArchivePending = false; comparisonRecordingBusy = false
+                switch result {
+                case .success(let saved):
+                    failedMovieArchive = nil; recordingArchiveNeedsPermission = false
+                    comparisonRecordingDirectory = saved.directory
+                    comparisonRecordingStatus = saved.cleanupError == nil ? "两路素材已保存"
+                        : "两路素材已保存；游戏内临时副本清理失败"
+                case .failure(let error):
+                    failedMovieArchive = (source, root)
+                    recordingArchiveNeedsPermission = ComparisonRecordingArchive.needsSourceAuthorization(error, source: source)
+                    comparisonRecordingStatus = recordingArchiveNeedsPermission
+                        ? "素材已录好，但读取游戏素材目录需要授权。请点击“授权并转移”；原文件已保留。"
+                        : "素材已录好，转移失败，原文件已保留：" + error.localizedDescription
+                }
+                toolbar?.refreshConfiguration()
+                onComparisonRecordingSettled?()
+            }
+        }
+        toolbar?.refreshConfiguration()
+    }
+    func retryRecordingArchive() {
+        guard canRetryRecordingArchive, let failedMovieArchive else { return }
+        if !recordingArchiveNeedsPermission {
+            archiveMovie(from: failedMovieArchive.source, to: failedMovieArchive.root); return
+        }
+        comparisonRecordingBusy = true
+        comparisonRecordingStatus = "等待授权读取素材目录…"
+        movieArchivePending = true
+        toolbar?.refreshConfiguration()
+        movieFolderAccess.chooseAccess(for: failedMovieArchive.source) { [weak self] selected in
+            guard let self else { return }
+            self.comparisonRecordingBusy = false
+            self.movieArchivePending = false
+            guard let selected else {
+                self.comparisonRecordingStatus = "授权已取消，素材仍保留在游戏目录，可再次点击“授权并转移”。"
+                self.toolbar?.refreshConfiguration()
+                self.onComparisonRecordingSettled?(); return
+            }
+            guard GameRecordingFolderAccess.accepts(selected, for: failedMovieArchive.source) else {
+                self.comparisonRecordingStatus = "请选择这次素材文件夹或其上一级 Recordings 文件夹；原文件已保留。"
+                self.toolbar?.refreshConfiguration()
+                self.onComparisonRecordingSettled?(); return
+            }
+            self.archiveMovie(from: failedMovieArchive.source, to: failedMovieArchive.root, selectedAccess: selected)
+        }
     }
 
     func toggleGameInterpolation() {
@@ -260,6 +308,15 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     init(onReport: @escaping (String) -> Void) {
         self.onReport = onReport
         super.init()
+        if let saved = UserDefaults.standard.dictionary(forKey: "pendingGameRecordingArchive"),
+           let source = saved["source"] as? String, let root = saved["root"] as? String,
+           UUID(uuidString: URL(fileURLWithPath: source).lastPathComponent) != nil {
+            failedMovieArchive = (URL(fileURLWithPath: source), URL(fileURLWithPath: root))
+            comparisonRecordingDirectory = failedMovieArchive?.source
+            recordingArchiveNeedsPermission = (saved["needsPermission"] as? Bool) ?? true
+            comparisonRecordingStatus = recordingArchiveNeedsPermission ? "上次素材尚未转移，请授权读取素材目录；原文件已保留。"
+                : "上次素材尚未转移，可重试转移；原文件已保留。"
+        }
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
             let image = NSImage(systemSymbolName: "waveform.path", accessibilityDescription: "SwitchViewer")
@@ -491,7 +548,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
                 confirmInterpolation(enabled: true)
                 interpolationControlStatus = supportsInterpolationControl ? "" : "重启游戏以启用面板开关；当前可按 ⌥⇧I"
                 supportsMovieControl = line.contains("movieControl=darwin-v1")
-                comparisonRecordingStatus = supportsMovieControl ? "" : "重启游戏以加载素材录制入口"
+                if failedMovieArchive == nil { comparisonRecordingStatus = supportsMovieControl ? "" : "重启游戏以加载素材录制入口" }
                 supportsTraceControl = line.contains("traceControl=darwin-v1")
                 frameTraceStatus = supportsTraceControl ? "" : "重启游戏以加载记录入口"
                 update("插帧库已加载，等待 Metal 游戏画面…")

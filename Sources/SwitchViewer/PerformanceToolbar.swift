@@ -47,6 +47,8 @@ final class PerformanceToolbar: NSPanel {
     private var configurationHeight: CGFloat = 200
     private var activeTab = -1
     private var selectingTab = false
+    /// Tests can inspect final layout without racing live-status resize animations.
+    var transitionDuration: TimeInterval = 0.28
     private var transitionRevision = 0
     private var lastSample = Date.distantPast
     private var freshnessTimer: Timer?
@@ -369,7 +371,7 @@ final class PerformanceToolbar: NSPanel {
             origin.y = max(visible.minY, origin.y)
         }
         let target = NSRect(origin: origin, size: NSSize(width: panelWidth, height: size))
-        let duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || !isVisible ? 0 : 0.28
+        let duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || !isVisible ? 0 : transitionDuration
         NSAnimationContext.runAnimationGroup { context in
             context.duration = duration
             context.timingFunction = CAMediaTimingFunction(controlPoints: 0.22, 0.8, 0.25, 1)

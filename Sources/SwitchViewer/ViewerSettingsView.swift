@@ -52,6 +52,10 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
     private let gameToggleStatus = NSTextField(labelWithString: "")
     private var movieButton: NSButton!
     private var movieFolderButton: NSButton!
+    private var movieRetryButton: NSButton!
+    private var archiveRecovery: NSStackView!
+    private var archiveRecoveryButton: NSButton!
+    private let archiveRecoveryStatus = NSTextField(wrappingLabelWithString: "")
     private let movieStatus = NSTextField(labelWithString: "")
     private var traceButton: NSButton!
     private let traceStatus = NSTextField(labelWithString: "")
@@ -104,6 +108,11 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
             row("插帧偏好", gameProfile), row("显示同步", gameDisplaySync), row("显示节奏", gameCadence),
             gameConfigurationStatus
         ])
+        archiveRecoveryButton = action("授权并转移上次素材", #selector(retryComparisonArchive))
+        archiveRecoveryButton.identifier = NSUserInterfaceItemIdentifier("pending-recording-recovery")
+        archiveRecoveryStatus.font = .systemFont(ofSize: 11)
+        archiveRecoveryStatus.textColor = .secondaryLabelColor
+        archiveRecovery = column([archiveRecoveryButton, archiveRecoveryStatus])
         let pluginLaunchers = owner.gameInjectionController.gamePlugins.map { plugin in
             let button = action(plugin.descriptor.name, #selector(startGamePlugin(_:)))
             button.identifier = NSUserInterfaceItemIdentifier(plugin.descriptor.id)
@@ -114,7 +123,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         }
         gameLaunchers = pluginLaunchers
         let gamePage = column([NSTextField(labelWithString: "选择游戏，启动后自动进入插帧面板。")]
-            + gameLaunchers)
+            + gameLaunchers + [archiveRecovery!])
         let screenView = column([row("窗口 / 屏幕", screenPicker)])
         let cardView = column([])
         cardLaunchers = cardView
@@ -165,7 +174,9 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         movieFolderButton = action("打开素材", #selector(openComparisonMovies))
         movieStatus.font = .systemFont(ofSize: 11)
         movieStatus.textColor = .secondaryLabelColor
-        let movieRow = horizontal([movieButton, movieFolderButton, NSView()])
+        movieRetryButton = action("重试转移", #selector(retryComparisonArchive))
+        movieRetryButton.identifier = NSUserInterfaceItemIdentifier("recording-archive-retry")
+        let movieRow = horizontal([movieButton, movieFolderButton, movieRetryButton, NSView()])
         let toolsRow = horizontal([
             captureTools, gameTools, action("打开日志", #selector(logs)), captureRecovery,
             action("退出 SwitchViewer", #selector(quitApplication)), NSView()
@@ -396,6 +407,9 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
             targetIDs = ids; screenPicker.removeAllItems(); screenPicker.addItems(withTitles: ids)
             if !ids.isEmpty { screenPicker.selectItem(at: min(max(0, selected), ids.count - 1)) }
         }
+        archiveRecoveryButton.title = owner.gameInjectionController.recordingArchiveNeedsPermission ? "授权并转移上次素材" : "重试转移上次素材"
+        archiveRecovery.isHidden = !owner.gameInjectionController.canRetryRecordingArchive
+        archiveRecoveryStatus.stringValue = owner.gameInjectionController.comparisonRecordingStatus
         gameConfigurationStatus.stringValue = owner.gameInjectionController.gameConfigurationStatus
         gameInterpolationHealth.stringValue = owner.gameInjectionController.interpolationPerformanceStatus
         gameInterpolationHealth.isHidden = gameInterpolationHealth.stringValue.isEmpty || !owner.gameInjectionController.isGameInterpolationEnabled
@@ -418,8 +432,12 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         movieButton.title = recording ? "停止录制" : (movieBusy ? "正在保存…" : "录制对比素材")
         movieButton.isEnabled = recording || (!movieBusy && (gameRunning
             ? owner.gameInjectionController.canRecordComparison : owner.hasSelectedSource && owner.frameInterpolationEnabled))
-        movieFolderButton.isEnabled = (gameRunning ? owner.gameInjectionController.comparisonRecordingDirectory : owner.comparisonRecordingDirectory) != nil
-        movieStatus.stringValue = gameRunning ? owner.gameInjectionController.comparisonRecordingStatus : owner.comparisonRecordingStatus
+        let gameArchive = gameRunning || owner.gameInjectionController.canRetryRecordingArchive
+        movieFolderButton.isEnabled = (gameArchive ? owner.gameInjectionController.comparisonRecordingDirectory : owner.comparisonRecordingDirectory) != nil
+        movieRetryButton.title = owner.gameInjectionController.recordingArchiveNeedsPermission ? "授权并转移" : "重试转移"
+        movieRetryButton.isHidden = !owner.gameInjectionController.canRetryRecordingArchive
+        movieRetryButton.isEnabled = owner.gameInjectionController.canRetryRecordingArchive
+        movieStatus.stringValue = gameArchive ? owner.gameInjectionController.comparisonRecordingStatus : owner.comparisonRecordingStatus
         movieStatus.isHidden = movieStatus.stringValue.isEmpty
         traceButton.isEnabled = owner.gameInjectionController.canRecordGameFrames
         traceStatus.stringValue = owner.gameInjectionController.frameTraceStatus
@@ -534,6 +552,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
     }
     @objc private func toggleGameInterpolation() { owner?.gameInjectionController.toggleGameInterpolation(); refresh() }
     @objc private func recordComparisonMovie() { owner?.toggleComparisonRecording(); refresh() }
+    @objc private func retryComparisonArchive() { owner?.gameInjectionController.retryRecordingArchive(); refresh() }
     @objc private func openComparisonMovies() { owner?.revealComparisonRecording() }
     @objc private func recordGameFrames() { owner?.gameInjectionController.recordGameFrames(); refresh() }
     @objc private func showPreview() { owner?.showPreview() }

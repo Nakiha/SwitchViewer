@@ -52,6 +52,28 @@ struct WorkflowCheck {
     static func popup(_ id: String, in view: NSView) -> NSPopUpButton {
         descendants(view).compactMap { $0 as? NSPopUpButton }.first { $0.identifier?.rawValue == id }!
     }
+    static func checkRecordingFolderAccess() {
+        let source = URL(fileURLWithPath: "/Game/Recordings/" + UUID().uuidString)
+        expect(GameRecordingFolderAccess.accepts(source, for: source), "recording authorization accepts only the requested clip")
+        expect(GameRecordingFolderAccess.accepts(URL(fileURLWithPath: source.path, isDirectory: true), for: source), "picker directory URLs match a previously inaccessible path")
+        expect(GameRecordingFolderAccess.accepts(source.deletingLastPathComponent(), for: source), "recording authorization accepts the generated Recordings folder")
+        expect(!GameRecordingFolderAccess.accepts(URL(fileURLWithPath: "/Game"), for: source), "recording authorization rejects whole-container access")
+        expect(!GameRecordingFolderAccess.accepts(URL(fileURLWithPath: "/Game/Recordings/" + UUID().uuidString), for: source), "recording authorization rejects another clip folder")
+        expect(!GameRecordingFolderAccess.accepts(URL(fileURLWithPath: "/"), for: source), "recording authorization rejects root-directory access")
+        let key = "pendingGameRecordingArchive", old = UserDefaults.standard.object(forKey: "pendingGameRecordingArchive")
+        defer {
+            if let old { UserDefaults.standard.set(old, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+        UserDefaults.standard.set(["source": source.path, "root": "/Movies/SwitchViewer", "needsPermission": true], forKey: key)
+        let restored = GameInjectionController(onReport: { _ in })
+        expect(restored.canRetryRecordingArchive && restored.recordingArchiveNeedsPermission, "relaunch restores a pending authorization without reading protected files")
+        expect(restored.comparisonRecordingDirectory == source, "relaunch retains the failed source directory")
+        restored.shutdown()
+        UserDefaults.standard.set(["source": source.path, "root": "/Movies/SwitchViewer", "needsPermission": false], forKey: key)
+        let writable = GameInjectionController(onReport: { _ in })
+        expect(writable.canRetryRecordingArchive && !writable.recordingArchiveNeedsPermission, "destination failures do not request unnecessary source authorization")
+        writable.shutdown()
+    }
     static func checkDeviceHotPlug() {
         var snapshot: [AVCaptureDevice] = []
         let view = ViewerSettingsView(owner: owner, discoverVideoDevices: { snapshot })
@@ -206,6 +228,7 @@ struct WorkflowCheck {
         app.delegate = owner
         later(1) {
             panel = app.windows.compactMap { $0 as? PerformanceToolbar }.first!
+            panel.transitionDuration = 0
             let choices = GlassChoiceControl(["延迟", "帧率"])
             expect((choices.arrangedSubviews.first as? NSSegmentedControl)?.selectedSegment == 0, "ordinary choices retain default selection")
             expect(panel.workflow == .selection && tabs.segmentCount == 2, "startup has only capture and game tabs")
@@ -257,6 +280,7 @@ struct WorkflowCheck {
                 later(3) { checkLiveConfigurationFailure() }
                 return
             }
+            checkRecordingFolderAccess()
             checkDeviceHotPlug()
             checkCaptureReconfiguration()
             checkMissingGame()

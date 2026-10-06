@@ -47,4 +47,17 @@ final class ComparisonRecordingArchiveTests: XCTestCase {
         XCTAssertThrowsError(try ComparisonRecordingArchive.transfer(from: incomplete, to: base.appendingPathComponent("Movies")))
         XCTAssertTrue(FileManager.default.fileExists(atPath: incomplete.path))
     }
+    func testPermissionErrorsDistinguishSourceAccessFromDestinationWriteFailure() {
+        let source = URL(fileURLWithPath: "/Game/Recordings/" + UUID().uuidString)
+        let denied = NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileReadNoPermission.rawValue,
+                             userInfo: [NSURLErrorKey: source])
+        XCTAssertTrue(ComparisonRecordingArchive.needsSourceAuthorization(denied, source: source))
+        let wrapped = NSError(domain: "Archive", code: 1, userInfo: [NSUnderlyingErrorKey: denied])
+        XCTAssertTrue(ComparisonRecordingArchive.needsSourceAuthorization(wrapped, source: source))
+        let destination = NSError(domain: NSCocoaErrorDomain, code: CocoaError.fileWriteNoPermission.rawValue,
+                                  userInfo: [NSFilePathErrorKey: "/Movies/SwitchViewer"])
+        XCTAssertFalse(ComparisonRecordingArchive.needsSourceAuthorization(destination, source: source))
+        XCTAssertFalse(ComparisonRecordingArchive.needsSourceAuthorization(CocoaError(.fileNoSuchFile), source: source))
+    }
+
 }

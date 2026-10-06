@@ -11,7 +11,7 @@ extension AppDelegate {
         comparisonRecorder.start()
     }
     func revealComparisonRecording() {
-        let url = gameInjectionController.isGameRunning
+        let url = gameInjectionController.isGameRunning || gameInjectionController.canRetryRecordingArchive
             ? gameInjectionController.comparisonRecordingDirectory : comparisonRecordingDirectory
         if let url { NSWorkspace.shared.open(url) }
     }

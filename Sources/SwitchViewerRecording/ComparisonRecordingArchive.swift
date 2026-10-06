@@ -47,6 +47,27 @@ public enum ComparisonRecordingArchive {
             return Saved(directory: destination, cleanupError: error.localizedDescription)
         }
     }
+    /// Foundation can wrap the actual POSIX permission denial in an underlying error.
+    public static func isPermissionDenied(_ error: Error) -> Bool {
+        let error = error as NSError
+        if error.domain == NSCocoaErrorDomain,
+           [CocoaError.fileReadNoPermission.rawValue, CocoaError.fileWriteNoPermission.rawValue].contains(error.code) { return true }
+        if error.domain == NSPOSIXErrorDomain, [1, 13].contains(error.code) { return true }
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? Error { return isPermissionDenied(underlying) }
+        return false
+    }
+    public static func needsSourceAuthorization(_ error: Error, source: URL) -> Bool {
+        guard isPermissionDenied(error) else { return false }
+        let error = error as NSError
+        let path = (error.userInfo[NSURLErrorKey] as? URL)?.path ?? (error.userInfo[NSFilePathErrorKey] as? String)
+        if let path {
+            let path = URL(fileURLWithPath: path).standardizedFileURL.path
+            let source = source.standardizedFileURL.path
+            return path == source || path.hasPrefix(source + "/")
+        }
+        if let underlying = error.userInfo[NSUnderlyingErrorKey] as? Error { return needsSourceAuthorization(underlying, source: source) }
+        return error.domain == NSCocoaErrorDomain && error.code == CocoaError.fileReadNoPermission.rawValue
+    }
     private static func digest(_ url: URL) throws -> SHA256.Digest {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
