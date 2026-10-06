@@ -11,7 +11,10 @@ struct WorkflowCheck {
     static var checks = 0
 
     static func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
-        guard condition() else { fputs("FAIL: \(message)\n", stderr); exit(1) }
+        guard condition() else {
+            owner.gameInjectionController.stopGame()
+            fputs("FAIL: \(message)\n", stderr); exit(1)
+        }
         checks += 1
         print("PASS: \(message)")
     }
@@ -242,6 +245,18 @@ struct WorkflowCheck {
                 }
                 return
             }
+            // A prior interrupted UI run may have left 0 ms in this test app's
+            // own defaults. The recording fixture needs a deterministic 2× baseline.
+            owner.gameInjectionController.interpolationOptions = .init()
+            owner.gameInjectionController.interpolationProfile = .lowLatency
+            owner.gameInjectionController.displaySyncEnabled = false
+            owner.gameInjectionController.presentationCadence = .uniform
+            if CommandLine.arguments.contains("--check-live-configuration-failure") {
+                select(1)
+                owner.gameInjectionController.startFixture(arguments: ["--configuration-failure-test"])
+                later(3) { checkLiveConfigurationFailure() }
+                return
+            }
             checkDeviceHotPlug()
             checkCaptureReconfiguration()
             checkMissingGame()
@@ -353,14 +368,99 @@ struct WorkflowCheck {
         expect(workflowTitle.stringValue == "游戏插帧 · 插帧测试窗口", "game runtime moves the game name into the toolbar title")
         validateLayout()
         checkCompactMetricsLayout()
-        checkGameMovieRecording { pauseGameAfterRecording() }
+        checkLiveGameConfiguration { checkGameMovieRecording { pauseGameAfterRecording() } }
     }
+    static func checkLiveConfigurationFailure() {
+        let game = owner.gameInjectionController
+        let original = game.desiredRuntimeConfiguration, pid = game.runningProcessID
+        expect(game.appliedRuntimeConfiguration == original, "failure fixture confirms original session")
+        game.interpolationOptions = .init(multiplier: .eight, delayBudgetMilliseconds: 80)
+        waitForConfiguration(original, remaining: 40) {
+            expect(game.gameConfigurationStatus.hasPrefix("切换失败，已保留："), "failed session reports rollback rather than success")
+            expect(game.desiredRuntimeConfiguration == original, "failed session rolls controls back to acknowledged settings")
+            expect(game.runningProcessID == pid, "failed configuration preserves the game process")
+            waitForGameDisplay(remaining: 40) {
+                game.interpolationOptions = .init(multiplier: .four, delayBudgetMilliseconds: 60)
+                waitForConfiguration(game.desiredRuntimeConfiguration, remaining: 40) {
+                    expect(game.runningProcessID == pid, "configuration can be changed successfully after rollback")
+                    waitForGameDisplay(remaining: 40) {
+                        game.stopGame()
+                        later(1) {
+                            expect(!game.isGameRunning, "failure fixture exits cleanly")
+                            print("Live configuration rollback: \(checks) checks passed")
+                            owner.gameInjectionController.shutdown(); NSApp.terminate(nil)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static func checkLiveGameConfiguration(_ completion: @escaping () -> Void) {
+        let game = owner.gameInjectionController
+        let initial = game.desiredRuntimeConfiguration
+        let pid = game.runningProcessID
+        expect(game.appliedRuntimeConfiguration == initial, "game confirms startup configuration")
+        let states: [GameRuntimeConfiguration] = [
+            .init(interpolation: .init(multiplier: .four, delayBudgetMilliseconds: 60), profile: .lowLatency, displaySync: false, cadence: .uniform),
+            .init(interpolation: .init(multiplier: .eight, delayBudgetMilliseconds: 80), profile: .lowLatency, displaySync: true, cadence: .lowLatency),
+            .init(interpolation: .init(multiplier: .two, delayBudgetMilliseconds: 0), profile: .clarity, displaySync: false, cadence: .lowLatency),
+            .init(interpolation: .init(multiplier: .two), profile: .clarity, displaySync: true, cadence: .uniform), initial
+        ]
+        func change(_ index: Int) {
+            if index == states.count { completion(); return }
+            let state = states[index]
+            game.interpolationOptions = state.interpolation
+            game.interpolationProfile = state.profile
+            game.displaySyncEnabled = state.displaySync
+            game.presentationCadence = state.cadence
+            expect(game.configurationRequestPending && !game.canRecordComparison, "live switch waits for game acknowledgement before recording")
+            waitForConfiguration(state, remaining: 40) {
+                expect(game.runningProcessID == pid, "live switch keeps the same game process")
+                expect(game.gameConfigurationStatus.hasPrefix("已生效："), "UI reports acknowledged configuration")
+                validateLayout()
+                waitForGameDisplay(remaining: 40) { change(index + 1) }
+            }
+        }
+        change(0)
+    }
+    static func waitForGameDisplay(remaining: Int, _ completion: @escaping () -> Void) {
+        later(0.2) {
+            let game = owner.gameInjectionController
+            if !game.status.contains("实际显示约") && remaining > 0 { waitForGameDisplay(remaining: remaining - 1, completion); return }
+            expect(game.status.contains("实际显示约"), "new configuration produces confirmed display frames")
+            completion()
+        }
+    }
+    static func waitForConfiguration(_ expected: GameRuntimeConfiguration, remaining: Int, _ completion: @escaping () -> Void) {
+        later(0.2) {
+            let game = owner.gameInjectionController
+            if game.configurationRequestPending && remaining > 0 {
+                waitForConfiguration(expected, remaining: remaining - 1, completion); return
+            }
+            expect(!game.configurationRequestPending && game.appliedRuntimeConfiguration == expected,
+                   "game atomically confirms multiplier, budget, profile, sync and cadence")
+            later(0.4, completion)
+        }
+    }
+
     static func checkGameMovieRecording(_ completion: @escaping () -> Void) {
         expect(owner.gameInjectionController.canRecordComparison, "fixture acknowledges paired movie recording control")
         owner.gameInjectionController.toggleComparisonRecording()
         later(2) {
             expect(owner.gameInjectionController.isComparisonRecording, "game confirms paired recording began")
             expect(!owner.gameInjectionController.canRecordComparison, "another recording cannot start during a session")
+            let game = owner.gameInjectionController
+            let before = game.desiredRuntimeConfiguration
+            game.interpolationOptions = .init(multiplier: .eight, delayBudgetMilliseconds: 0)
+            game.interpolationProfile = .lowLatency
+            game.displaySyncEnabled.toggle()
+            game.presentationCadence = .lowLatency
+            expect(game.desiredRuntimeConfiguration == before && !game.canChangeConfiguration, "recording blocks all runtime configuration writes")
+            panel.refreshConfiguration()
+            let view = panel.contentView!
+            expect(!popup("game-profile", in: view).isEnabled && !popup("game-cadence", in: view).isEnabled,
+                   "recording disables processing profile and cadence controls")
             owner.gameInjectionController.toggleComparisonRecording()
             waitForGameMovieSave(remaining: 20, completion)
         }
@@ -392,7 +492,14 @@ struct WorkflowCheck {
         toggle.sendAction(toggle.action!, to: toggle.target)
         later(1) {
             expect(!owner.gameInjectionController.isGameInterpolationEnabled, "shared processing toggle pauses actual game interpolation")
-            gamePanels()
+            let game = owner.gameInjectionController
+            let original = game.interpolationOptions
+            game.interpolationOptions = .init(multiplier: .four, delayBudgetMilliseconds: 45)
+            waitForConfiguration(game.desiredRuntimeConfiguration, remaining: 40) {
+                expect(!game.isGameInterpolationEnabled, "configuration changes preserve paused original view")
+                game.interpolationOptions = original
+                waitForConfiguration(game.desiredRuntimeConfiguration, remaining: 40) { gamePanels() }
+            }
         }
     }
     static func checkCompactMetricsLayout() {

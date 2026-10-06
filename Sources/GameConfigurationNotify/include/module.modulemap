@@ -1,0 +1,4 @@
+module GameConfigurationNotify {
+    header "GameConfigurationNotify.h"
+    export *
+}

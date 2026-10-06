@@ -8,11 +8,12 @@ struct GameHookConfiguration {
     let cadence: GamePresentationCadence
     let uniformPreparation: Bool
     init(processName: String = ProcessInfo.processInfo.processName, arguments: [String] = CommandLine.arguments,
-         environment: [String: String] = ProcessInfo.processInfo.environment) {
+         environment: [String: String] = ProcessInfo.processInfo.environment,
+         runtime: GameRuntimeConfiguration? = nil) {
         fixture = processName == "GameHookFixture"
         self.arguments = Set(arguments)
-        cadence = .init(configuration: environment["SWITCHVIEWER_GAME_CADENCE"])
-        uniformPreparation = cadence == .uniform && environment["SWITCHVIEWER_GAME_DISPLAY_SYNC"] == "0"
+        cadence = runtime?.cadence ?? .init(configuration: environment["SWITCHVIEWER_GAME_CADENCE"])
+        uniformPreparation = cadence == .uniform && (runtime?.displaySync ?? (environment["SWITCHVIEWER_GAME_DISPLAY_SYNC"] != "0")) == false
             && !(fixture && self.arguments.contains("--legacy-preparation-admission"))
     }
     func presentationOptions(syncEnabled: Bool?) -> GameFramePresentationPolicy.Options {

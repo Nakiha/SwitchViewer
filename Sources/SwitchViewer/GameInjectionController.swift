@@ -30,6 +30,89 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private(set) var interpolationControlStatus = ""
     var canToggleGameInterpolation: Bool { isGameRunning && supportsInterpolationControl && !interpolationRequestPending }
 
+    private var configurationChannel: GameConfigurationChannel?
+    private var supportsConfigurationControl = false
+    private var configurationRequest: DispatchWorkItem?
+    private var configurationSend: DispatchWorkItem?
+    private var configurationRevision: UInt32 = 0
+    private(set) var configurationRequestPending = false
+    private(set) var appliedRuntimeConfiguration: GameRuntimeConfiguration?
+    private(set) var gameConfigurationStatus = "运行中修改可即时生效。"
+    var runningProcessID: Int32? { isGameRunning ? process?.processIdentifier : nil }
+    var canChangeConfiguration: Bool { !comparisonRecordingBusy }
+    var desiredRuntimeConfiguration: GameRuntimeConfiguration {
+        .init(interpolation: interpolationOptions, profile: interpolationProfile,
+              displaySync: displaySyncEnabled, cadence: presentationCadence)
+    }
+    private func requestRuntimeConfiguration() {
+        guard isGameRunning else { return }
+        guard loaded else { gameConfigurationStatus = "等待游戏加载后应用设置…"; return }
+        guard supportsConfigurationControl, let configurationChannel else {
+            gameConfigurationStatus = "当前游戏使用旧版插帧库，重新启动游戏后可即时切换。"; return
+        }
+        configurationRevision &+= 1
+        if configurationRevision == 0 { configurationRevision = 1 }
+        let revision = configurationRevision
+        configurationRequest?.cancel()
+        configurationSend?.cancel()
+        configurationRequestPending = true
+        gameConfigurationStatus = "正在切换…" + (appliedRuntimeConfiguration.map { " 当前：" + $0.summary } ?? "")
+        let desired = desiredRuntimeConfiguration, channelName = configurationChannel.name
+        let send = DispatchWorkItem { [weak self] in
+            guard let self, self.configurationRevision == revision, self.configurationChannel === configurationChannel else { return }
+            self.configurationSend = nil
+            do {
+                try configurationChannel.send(desired, requestID: revision)
+                let timeout = DispatchWorkItem { [weak self] in
+                    guard let self, self.configurationRevision == revision, self.configurationRequestPending,
+                          self.configurationChannel?.name == channelName else { return }
+                    // A late acknowledgement remains authoritative. Until then,
+                    // recording stays disabled to avoid mixing configurations.
+                    self.gameConfigurationStatus = "游戏尚未确认切换。" + (self.appliedRuntimeConfiguration.map { " 当前：" + $0.summary } ?? "")
+                    self.toolbar?.refreshConfiguration()
+                }
+                self.configurationRequest = timeout
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+            } catch {
+                self.configurationRequestPending = false
+                self.gameConfigurationStatus = "无法发送配置：" + error.localizedDescription
+                self.toolbar?.refreshConfiguration()
+            }
+        }
+        configurationSend = send
+        // Rapid control changes publish one complete final configuration.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: send)
+        toolbar?.refreshConfiguration()
+    }
+    private func consumeConfiguration(_ line: String) {
+        guard let field = line.split(separator: " ").first(where: { $0.hasPrefix("value=") }),
+              let value = UInt64(field.dropFirst(6)), let decoded = GameRuntimeConfiguration.decode(value) else { return }
+        appliedRuntimeConfiguration = decoded.configuration
+        if decoded.requestID == configurationRevision {
+            configurationRequest?.cancel()
+            configurationRequestPending = false
+            interpolationPerformanceStatus = ""
+            active = false
+            toolbar?.resetMetrics()
+            let failed = line.contains("CONFIGURATION failed")
+            gameConfigurationStatus = (failed ? "切换失败，已保留：" : "已生效：") + decoded.configuration.summary
+            if failed {
+                // Roll the controls back to the acknowledged configuration.
+                decoded.configuration.interpolation.save(prefix: "gameInterpolation")
+                UserDefaults.standard.set(decoded.configuration.profile.rawValue, forKey: "gameInterpolationProfile")
+                UserDefaults.standard.set(decoded.configuration.displaySync, forKey: "gameDisplaySyncEnabled")
+                UserDefaults.standard.set(decoded.configuration.cadence.rawValue, forKey: "gamePresentationCadence")
+                if let detail = line.split(separator: " ").first(where: { $0.hasPrefix("detail=") }),
+                   let data = Data(base64Encoded: String(detail.dropFirst(7))), let message = String(data: data, encoding: .utf8) {
+                    gameConfigurationStatus += "。" + message
+                }
+            } else if desiredRuntimeConfiguration != decoded.configuration { requestRuntimeConfiguration() }
+        } else if configurationRequestPending {
+            gameConfigurationStatus = "正在切换… 当前：" + decoded.configuration.summary
+        }
+        update(isGameInterpolationEnabled ? "配置已更新，等待新画面…" : "正在显示游戏原画面\n按 ⌥⇧I 恢复插帧")
+    }
+
     private var supportsMovieControl = false
     private var movieRequest: DispatchWorkItem?
     private var movieArchivePending = false
@@ -40,7 +123,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private(set) var comparisonRecordingStatus = ""
     private(set) var comparisonRecordingDirectory: URL?
     var canRecordComparison: Bool {
-        isGameRunning && supportsMovieControl && isGameInterpolationEnabled && !comparisonRecordingBusy
+        isGameRunning && supportsMovieControl && isGameInterpolationEnabled && !comparisonRecordingBusy && !configurationRequestPending
     }
     func toggleComparisonRecording() {
         guard let process else { return }
@@ -143,20 +226,20 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
 
     var displaySyncEnabled: Bool {
         get { UserDefaults.standard.bool(forKey: "gameDisplaySyncEnabled") }
-        set { UserDefaults.standard.set(newValue, forKey: "gameDisplaySyncEnabled") }
+        set { guard canChangeConfiguration else { return }; UserDefaults.standard.set(newValue, forKey: "gameDisplaySyncEnabled"); requestRuntimeConfiguration() }
     }
 
     var interpolationProfile: GameInterpolationProfile {
         get { GameInterpolationProfile(rawValue: UserDefaults.standard.string(forKey: "gameInterpolationProfile") ?? "") ?? .clarity }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: "gameInterpolationProfile") }
+        set { guard canChangeConfiguration else { return }; UserDefaults.standard.set(newValue.rawValue, forKey: "gameInterpolationProfile"); requestRuntimeConfiguration() }
     }
     var interpolationOptions: InterpolationOptions {
         get { InterpolationOptions.load(prefix: "gameInterpolation") }
-        set { newValue.save(prefix: "gameInterpolation") }
+        set { guard canChangeConfiguration else { return }; newValue.save(prefix: "gameInterpolation"); requestRuntimeConfiguration() }
     }
     var presentationCadence: GamePresentationCadence {
         get { .init(configuration: UserDefaults.standard.string(forKey: "gamePresentationCadence")) }
-        set { UserDefaults.standard.set(newValue.rawValue, forKey: "gamePresentationCadence") }
+        set { guard canChangeConfiguration else { return }; UserDefaults.standard.set(newValue.rawValue, forKey: "gamePresentationCadence"); requestRuntimeConfiguration() }
     }
 
     func recordGameFrames() {
@@ -273,9 +356,10 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         launch(appURL: installed, plugin: plugin)
     }
 
-    @objc func startFixture() {
+    @objc func startFixture() { startFixture(arguments: []) }
+    func startFixture(arguments: [String]) {
         guard let executable = resource("GameHookFixture") else { update("找不到插帧测试程序，请重新构建应用。"); return }
-        launch(executable: executable, name: "插帧测试窗口", plugin: GamePluginRegistry.builtIn.fallback)
+        launch(executable: executable, name: "插帧测试窗口", plugin: GamePluginRegistry.builtIn.fallback, arguments: arguments)
     }
 
     private func launch(appURL: URL, plugin: any GameIntegrationPlugin) {
@@ -290,13 +374,14 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         launch(executable: executable, name: appURL.deletingPathExtension().lastPathComponent, plugin: plugin)
     }
 
-    private func launch(executable: URL, name: String, plugin: any GameIntegrationPlugin) {
+    private func launch(executable: URL, name: String, plugin: any GameIntegrationPlugin, arguments: [String] = []) {
         guard #available(macOS 26.0, *) else { update("游戏内 Apple 插帧需要 macOS 26 或更新版本。"); return }
         guard process == nil else { update("请先退出本次启动的游戏。"); return }
         guard let library = resource("libSwitchViewerGameHook.dylib") else { update("找不到游戏内插帧库，请重新构建应用。"); return }
         onWillLaunch?()
         let child = Process()
         child.executableURL = executable
+        child.arguments = arguments
         child.currentDirectoryURL = executable.deletingLastPathComponent()
         var environment = ProcessInfo.processInfo.environment
         // Never propagate an unrelated injection chain into the target game.
@@ -316,6 +401,12 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         } else {
             movieArchiveRoot = ComparisonMovieRecorder.recordingsDirectory()
         }
+        let identifier = UUID().uuidString
+        configurationChannel = try? GameConfigurationChannel(identifier: identifier)
+        environment["SWITCHVIEWER_GAME_CONFIGURATION_CHANNEL"] = configurationChannel == nil ? nil : identifier
+        appliedRuntimeConfiguration = nil
+        configurationRevision = 0
+        gameConfigurationStatus = "等待游戏确认配置…"
         child.environment = environment
         let logDirectory = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Logs/SwitchViewer/GameInjection", isDirectory: true)
@@ -358,8 +449,12 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
             // pipe whose closed reader could deliver SIGPIPE to the game.
             logTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self, weak child] _ in
                 guard let self, self.process === child else { return }
-                if let data = try? self.logReader?.read(upToCount: 65_536), !data.isEmpty {
+                // Detailed 8× trace can exceed one 64 KiB read per tick. Drain a
+                // bounded batch so acknowledgements do not sit behind old frames.
+                for _ in 0..<8 {
+                    guard let data = try? self.logReader?.read(upToCount: 262_144), !data.isEmpty else { break }
                     self.consume(String(decoding: data, as: UTF8.self))
+                    if data.count < 262_144 { break }
                 }
                 if self.active, Date().timeIntervalSince(self.lastDisplayUpdate) > 5 {
                     self.active = false
@@ -390,6 +485,8 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
             onReport(String(line))
             if line.contains("LOADED") {
                 loaded = true
+                supportsConfigurationControl = line.contains("configurationControl=notify-state-v1") && configurationChannel != nil
+                if !supportsConfigurationControl { gameConfigurationStatus = "当前游戏使用旧版插帧库，重新启动游戏后可即时切换。" }
                 supportsInterpolationControl = line.contains("interpolationControl=darwin-v1")
                 confirmInterpolation(enabled: true)
                 interpolationControlStatus = supportsInterpolationControl ? "" : "重启游戏以启用面板开关；当前可按 ⌥⇧I"
@@ -402,6 +499,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
             else if let status = line.range(of: "INTERPOLATION_STATUS ") {
                 interpolationPerformanceStatus = String(line[status.upperBound...])
             }
+            else if line.contains("CONFIGURATION ") { consumeConfiguration(String(line)) }
             else if line.contains("MOVIE_RECORD ") { consumeMovieRecord(String(line)) }
             else if line.contains("FRAME_TRACE begin") {
                 traceRequest?.cancel()
@@ -438,7 +536,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
                 lastDisplayUpdate = Date()
                 timeout?.cancel()
                 let fps = line.components(separatedBy: "outputFPS=").last ?? "—"
-                update("游戏内 Apple 插帧正在运行 · 目标 2×\n实际显示约 \(fps) fps")
+                update("游戏内 Apple 插帧正在运行 · 目标 \(appliedRuntimeConfiguration?.interpolation.multiplier.label ?? interpolationOptions.multiplier.label)\n实际显示约 \(fps) fps")
             }
             else if line.contains("ERROR") { active = false; update("插帧暂不可用，保留游戏原画面。\n\(line.components(separatedBy: "] ").last ?? String(line))") }
             else if line.contains("PAUSED") { confirmInterpolation(enabled: false); active = false; toolbar?.resetMetrics(); update("正在显示游戏原画面\n按 ⌥⇧I 恢复插帧") }
@@ -452,6 +550,14 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         toolbar?.refreshConfiguration()
         onReport("游戏内插帧; \(message)") }
     private func finish() {
+        configurationSend?.cancel()
+        configurationSend = nil
+        configurationRequest?.cancel()
+        configurationChannel = nil
+        supportsConfigurationControl = false
+        configurationRequestPending = false
+        appliedRuntimeConfiguration = nil
+        gameConfigurationStatus = "运行中修改可即时生效。"
         movieRequest?.cancel()
         supportsMovieControl = false
         if comparisonRecordingBusy && !movieArchivePending { comparisonRecordingStatus = "游戏退出前未确认录制保存，请检查素材目录" }
@@ -490,6 +596,10 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         requestedStop = true; process?.terminate()
     }
     func shutdown() {
+        configurationSend?.cancel()
+        configurationSend = nil
+        configurationRequest?.cancel()
+        configurationChannel = nil
         if comparisonRecordingBusy, let process {
             GameMovieRecordingControl.request(processID: process.processIdentifier, start: false)
         }

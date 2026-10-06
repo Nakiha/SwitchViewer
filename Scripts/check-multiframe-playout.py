@@ -88,6 +88,7 @@ def run(name, binaries, factor, budget, width, out):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--baseline", type=Path, help="Previous release binaries directory")
+    parser.add_argument("--2x-only", dest="two_x_only", action="store_true", help="Only verify default 2x presentation, optionally against a baseline")
     parser.add_argument("--out", type=Path, default=ROOT / ".build/multiframe-playout")
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -99,8 +100,9 @@ def main():
             stats.append(run(f"current-2x-{repeat}", current, 2, None, 1280, args.out))
     else:
         stats.append(run("current-2x", current, 2, None, 1280, args.out))
-    for name, factor, budget, width in [("4x-60ms", 4, 60, 1280), ("8x-80ms", 8, 80, 1280),
-                                       ("4x-zero-budget", 4, 0, 1280), ("8x-overloaded", 8, 60, 1920)]:
+    cases = [] if args.two_x_only else [("4x-60ms", 4, 60, 1280), ("8x-80ms", 8, 80, 1280),
+                                           ("4x-zero-budget", 4, 0, 1280), ("8x-overloaded", 8, 60, 1920)]
+    for name, factor, budget, width in cases:
         stats.append(run(name, current, factor, budget, width, args.out))
     report = {"runs": stats, "limits": "30fps synthetic game, 120Hz desktop; excludes actual game GPU load and input-to-photon latency"}
     (args.out / "summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
@@ -113,7 +115,8 @@ def main():
             after = sum(s[metric] for s in new) / len(new)
             assert after <= before + 2, f"2x regression: {metric}: {before:.2f} -> {after:.2f}"
         assert sum(s["originalDeliveryPercent"] for s in new) / len(new) >= sum(s["originalDeliveryPercent"] for s in old) / len(old) - 1
-    print("PASS: phase ordering, expiry, budget, overload and 2x checks", flush=True)
+    print("PASS: default 2x ordering, expiry and baseline checks" if args.two_x_only else
+          "PASS: phase ordering, expiry, budget, overload and 2x checks", flush=True)
 
 
 if __name__ == "__main__":

@@ -73,7 +73,9 @@ public func startGameHook() {
             }
             return event
         }
-        report("LOADED pid=\(ProcessInfo.processInfo.processIdentifier) pipeline=prepared-pair-v24 plugin=\(GameHookPluginRuntime.selectedID) traceControl=darwin-v1 interpolationControl=darwin-v1 movieControl=darwin-v1 cadence=\(GameHookConfiguration().cadence.rawValue) 游戏内 Metal 插帧库已加载，等待画面")
+        let liveConfiguration = GameInterpolator.shared.startConfigurationControl()
+        report("LOADED pid=\(ProcessInfo.processInfo.processIdentifier) pipeline=prepared-pair-v24 plugin=\(GameHookPluginRuntime.selectedID) traceControl=darwin-v1 interpolationControl=darwin-v1 movieControl=darwin-v1 configurationControl=\(liveConfiguration ? "notify-state-v1" : "unavailable") cadence=\(GameHookConfiguration().cadence.rawValue) 游戏内 Metal 插帧库已加载，等待画面")
+        GameInterpolator.shared.reportCurrentConfiguration()
     }
 }
 

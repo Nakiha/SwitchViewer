@@ -12,6 +12,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
     private let gameProfile = NSPopUpButton()
     private let gameInterpolationOptions = InterpolationOptionsControl(identifier: "game-interpolation-options")
     private let captureInterpolationOptions = InterpolationOptionsControl(identifier: "capture-interpolation-options")
+    private let gameConfigurationStatus = NSTextField(wrappingLabelWithString: "")
     private let gameInterpolationHealth = NSTextField(wrappingLabelWithString: "")
     private let captureInterpolationHealth = NSTextField(wrappingLabelWithString: "")
     private let gameCadence = NSPopUpButton()
@@ -72,7 +73,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         sourceKinds.selection = owner.hasSelectedSource && owner.videoSource == .screen ? 1 : 0
         sourceKinds.onChange = { [weak self] _ in self?.selectSourceKind() }
 
-        for health in [gameInterpolationHealth, captureInterpolationHealth] {
+        for health in [gameInterpolationHealth, captureInterpolationHealth, gameConfigurationStatus] {
             health.font = .systemFont(ofSize: 11); health.textColor = .secondaryLabelColor
         }
         gameInterpolationOptions.onChange = { [weak self] options in
@@ -83,21 +84,25 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
             self?.owner?.applyInterpolationOptions(options)
             self?.refresh()
         }
+        gameConfigurationStatus.identifier = NSUserInterfaceItemIdentifier("game-configuration-status")
+        gameProfile.identifier = NSUserInterfaceItemIdentifier("game-profile")
+        gameDisplaySync.identifier = NSUserInterfaceItemIdentifier("game-display-sync")
+        gameCadence.identifier = NSUserInterfaceItemIdentifier("game-cadence")
         gameProfile.addItems(withTitles: ["清晰优先（最高 1080p）", "速度优先（最高 720p）"])
         gameProfile.target = self
         gameProfile.action = #selector(changeGameProfile)
-        gameProfile.toolTip = "设置生成帧的最高计算分辨率；720p 计算更快，1080p 细节更多。原帧保留原分辨率。下次启动游戏生效。"
+        gameProfile.toolTip = "设置生成帧的最高计算分辨率；720p 计算更快，1080p 细节更多。原帧保留原分辨率。运行中修改可即时生效。"
         gameDisplaySync.target = self
         gameDisplaySync.action = #selector(changeGameDisplaySync)
-        gameDisplaySync.toolTip = "关闭可能缩短呈现等待，但可能撕裂。下次启动游戏生效。"
+        gameDisplaySync.toolTip = "关闭可能缩短呈现等待，但可能撕裂。运行中修改可即时生效。"
         gameCadence.addItems(withTitles: GamePresentationCadence.allCases.map(\.label))
         gameCadence.target = self
         gameCadence.action = #selector(changeGameCadence)
-        gameCadence.toolTip = "帧间隔均匀优先：减少帧集中显示，但可能增加等待；响应速度优先：尽快显示。关闭垂直同步时生效，下次启动游戏生效。"
+        gameCadence.toolTip = "帧间隔均匀优先：减少帧集中显示，但可能增加等待；响应速度优先：尽快显示。关闭垂直同步时生效，运行中修改可即时生效。"
         gameProcessing = column([
             gameInterpolation, gameInterpolationOptions, gameInterpolationHealth,
             row("插帧偏好", gameProfile), row("显示同步", gameDisplaySync), row("显示节奏", gameCadence),
-            NSTextField(labelWithString: "以上偏好在下次启动游戏时生效。")
+            gameConfigurationStatus
         ])
         let pluginLaunchers = owner.gameInjectionController.gamePlugins.map { plugin in
             let button = action(plugin.descriptor.name, #selector(startGamePlugin(_:)))
@@ -391,6 +396,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
             targetIDs = ids; screenPicker.removeAllItems(); screenPicker.addItems(withTitles: ids)
             if !ids.isEmpty { screenPicker.selectItem(at: min(max(0, selected), ids.count - 1)) }
         }
+        gameConfigurationStatus.stringValue = owner.gameInjectionController.gameConfigurationStatus
         gameInterpolationHealth.stringValue = owner.gameInjectionController.interpolationPerformanceStatus
         gameInterpolationHealth.isHidden = gameInterpolationHealth.stringValue.isEmpty || !owner.gameInjectionController.isGameInterpolationEnabled
         captureInterpolationHealth.stringValue = owner.interpolationPerformanceStatus
@@ -400,9 +406,9 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         gameInterpolationOptions.setControlsEnabled(!owner.gameInjectionController.comparisonRecordingBusy)
         captureInterpolationOptions.setControlsEnabled(!gameRunning && !owner.comparisonRecorder.isBusy)
         gameProfile.selectItem(at: owner.gameInjectionController.interpolationProfile == .lowLatency ? 1 : 0)
-        gameProfile.isEnabled = true
+        gameProfile.isEnabled = owner.gameInjectionController.canChangeConfiguration
         gameDisplaySync.state = owner.gameInjectionController.displaySyncEnabled ? .on : .off
-        gameDisplaySync.isEnabled = true
+        gameDisplaySync.isEnabled = owner.gameInjectionController.canChangeConfiguration
         gameCadence.selectItem(at: GamePresentationCadence.allCases.firstIndex(of: owner.gameInjectionController.presentationCadence) ?? 0)
         gameToggle.title = owner.gameInjectionController.isGameInterpolationEnabled ? "关闭插帧" : "开启插帧"
         gameToggle.isEnabled = owner.gameInjectionController.canToggleGameInterpolation && !owner.gameInjectionController.comparisonRecordingBusy
@@ -419,7 +425,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         traceStatus.stringValue = owner.gameInjectionController.frameTraceStatus
         traceStatus.isHidden = !gameRunning || traceStatus.stringValue.isEmpty
         gameLaunchers.forEach { $0.isEnabled = !gameRunning }
-        gameCadence.isEnabled = !owner.gameInjectionController.displaySyncEnabled
+        gameCadence.isEnabled = !owner.gameInjectionController.displaySyncEnabled && owner.gameInjectionController.canChangeConfiguration
         startButton.isEnabled = !gameRunning && (sourceKinds.selection == 1 ? !ids.isEmpty : !selectedFormats.isEmpty)
         refreshButton.title = sourceKinds.selection == 1 && !ScreenCaptureSource.hasPermission && !owner.screenContentAccessConfirmed ? "授权屏幕录制" : "刷新来源"
         backend.selectItem(at: FrameInterpolationMode.allCases.firstIndex(of: owner.frameInterpolationMode) ?? 1)

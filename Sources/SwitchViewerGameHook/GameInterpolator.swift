@@ -70,7 +70,8 @@ final class GameInterpolator {
         }
     }
     func startComparisonRecording() {
-        lock.lock(); let paused = originalView; lock.unlock()
+        lock.lock(); let paused = originalView, changing = configurationChanging; lock.unlock()
+        guard !changing else { report("MOVIE_RECORD failed detail=" + Data("请等待配置切换完成".utf8).base64EncodedString()); return }
         guard !paused else { report("MOVIE_RECORD failed detail=" + Data("请先开启插帧".utf8).base64EncodedString()); return }
         let root = ProcessInfo.processInfo.processName == "GameHookFixture"
             ? ProcessInfo.processInfo.environment["SWITCHVIEWER_COMPARISON_RECORDING_ROOT"].map { URL(fileURLWithPath: $0) }
@@ -98,7 +99,15 @@ final class GameInterpolator {
     private var previousTime: Double = 0
     private var previousSequence: UInt64 = 0
     private var preparedPreviousPlan: GameFramePlayoutPlanner.Plan?
-    private let interpolationOptions = InterpolationOptions.from(environment: ProcessInfo.processInfo.environment)
+    // Worker and main own separate snapshots, published only at an epoch boundary.
+    private var runtimeConfiguration = GameRuntimeConfiguration.from(environment: ProcessInfo.processInfo.environment)
+    private var interpolationOptions: InterpolationOptions { runtimeConfiguration.interpolation }
+    private var pendingConfiguration: (requestID: UInt32, configuration: GameRuntimeConfiguration)?
+    private var configurationApplying = false
+    private var configurationChanging = false // Protected by lock; gates capture admission.
+    private var configurationChannel: GameConfigurationChannel? // Main queue only.
+    private var lastConfigurationRequestID: UInt32 = 0 // Main queue only.
+    private var presentationConfiguration = GameRuntimeConfiguration.from(environment: ProcessInfo.processInfo.environment)
     private var multiFrameDelay = MultiFrameDelayController()
     private var pressure = GameFramePressureController()
     private var lastPressureReport: Double = 0
@@ -112,11 +121,11 @@ final class GameInterpolator {
     private var generated = 0
     private var lastReport: Double = 0
     private var playout = GameFramePlayoutPlanner()
-    private var pairSequence: UInt64 = 0
+    private var frameSequence = GameFrameSequence()
     // Only accessed on the main queue.
     private var overlay: CAMetalLayer?
     private var presentationEpoch = 0
-    private let hookConfiguration = GameHookConfiguration()
+    private var hookConfiguration = GameHookConfiguration()
     private let submissions = GameFrameSubmissionQueue(now: { CACurrentMediaTime() }, schedule: { time, task in
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0, time - CACurrentMediaTime()), execute: task)
     }, deferTask: { task in DispatchQueue.main.async(execute: task) })
@@ -212,7 +221,7 @@ final class GameInterpolator {
             }
         }
         // 原来这三种跳过都是静默的，采集率掉了也看不出来。
-        if busy { lock.unlock(); trace.count(.captureSkippedBusy); return captureID }
+        if busy || configurationChanging { lock.unlock(); trace.count(.captureSkippedBusy); return captureID }
         if originalView { lock.unlock(); trace.count(.captureSkippedPaused); return captureID }
         if let selected = sourceLayer, selected !== layer {
             lock.unlock(); trace.count(.captureSkippedOtherLayer); return captureID
@@ -302,7 +311,108 @@ final class GameInterpolator {
         frameTrace.record(event)
     }
 
-    private func releaseJob() { lock.lock(); busy = false; lock.unlock() }
+    private func releaseJob() {
+        lock.lock(); busy = false; let changing = configurationChanging; lock.unlock()
+        if changing { work.async { [self] in applyPendingConfiguration() } }
+    }
+
+    func startConfigurationControl() -> Bool {
+        guard let identifier = ProcessInfo.processInfo.environment["SWITCHVIEWER_GAME_CONFIGURATION_CHANNEL"],
+              let channel = try? GameConfigurationChannel(identifier: identifier) else { return false }
+        configurationChannel = channel
+        channel.observe { _, _, _, _, _ in
+            DispatchQueue.main.async { GameInterpolator.shared.receiveConfiguration() }
+        }
+        return true
+    }
+    func reportCurrentConfiguration() {
+        report("CONFIGURATION current value=\(presentationConfiguration.encoded(requestID: 0))")
+        receiveConfiguration()
+    }
+    private func receiveConfiguration() {
+        guard let request = configurationChannel?.read(), request.requestID > lastConfigurationRequestID else { return }
+        lastConfigurationRequestID = request.requestID
+        guard !comparisonRecorder.isBusy else {
+            configurationAcknowledgement(requestID: request.requestID, error: "录制期间无法修改配置")
+            return
+        }
+        lock.lock(); configurationChanging = true; lock.unlock()
+        // Invalidate timers and drawable acquisitions immediately. The native game
+        // keeps presenting while the last Apple job drains on the worker queue.
+        presentationEpoch = -1
+        submissions.reset(keepingSubmissionOrder: true)
+        setOverlayHidden(true, reason: "configurationChanging")
+        work.async { [self] in
+            pendingConfiguration = request
+            applyPendingConfiguration()
+        }
+    }
+    private func configurationAcknowledgement(requestID: UInt32, error: String?) {
+        let detail = error.map { " detail=" + Data($0.utf8).base64EncodedString() } ?? ""
+        let value = presentationConfiguration.encoded(requestID: requestID)
+        var event = GameFrameTrace.Event(error == nil ? "configurationApplied" : "configurationFailed", sequence: 0, time: CACurrentMediaTime())
+        event.reason = String(value); event.multiplier = presentationConfiguration.interpolation.multiplier.rawValue
+        frameTrace.record(event)
+        report("CONFIGURATION \(error == nil ? "applied" : "failed") value=\(value)" + detail)
+    }
+    /// Worker queue only. Never replace a session while an Apple job owns it.
+    private func applyPendingConfiguration() {
+        guard let request = pendingConfiguration, !configurationApplying, !interpolationBusy else { return }
+        lock.lock(); let capturing = busy; lock.unlock()
+        guard !capturing else { return }
+        pendingConfiguration = nil
+        configurationApplying = true
+        var failure: String?
+        do {
+            let rebuild = request.configuration.interpolation.multiplier != runtimeConfiguration.interpolation.multiplier
+                || request.configuration.profile != runtimeConfiguration.profile
+            if rebuild, geometry.width > 0, geometry.height > 0 {
+                if ProcessInfo.processInfo.processName == "GameHookFixture",
+                   CommandLine.arguments.contains("--configuration-failure-test"),
+                   request.configuration.interpolation.multiplier == .eight {
+                    throw NSError(domain: "SwitchViewer.Fixture", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "测试模拟：插帧会话创建失败"])
+                }
+                // Construct before replacing: an unsupported configuration leaves
+                // the known-working session available for rollback.
+                let candidate = try AppleDownsampledFrameInterpolator(width: Int(geometry.width), height: Int(geometry.height),
+                    maximumProxyWidth: request.configuration.profile.maximumProxyWidth,
+                    multiplier: request.configuration.interpolation.multiplier)
+                interpolator = candidate
+                report("INTERPOLATION_PROXY width=\(candidate.proxySize.width) height=\(candidate.proxySize.height)")
+            }
+            runtimeConfiguration = request.configuration
+        } catch { failure = error.localizedDescription }
+        previous = nil; preparedPreviousPlan = nil
+        playout.reset(); pressure.reset(); multiFrameDelay.reset(); pressureGeneration += 1
+        epoch += 1
+        let revision = epoch, applied = runtimeConfiguration, error = failure
+        DispatchQueue.main.async { [self] in
+            presentationConfiguration = applied
+            hookConfiguration = GameHookConfiguration(runtime: applied)
+            // Already committed Metal presents cannot be cancelled. Detach their
+            // layer so an old timed drawable cannot reappear after the switch.
+            // Geometry-only changes still reuse their layer as before.
+            overlay?.removeFromSuperlayer(); overlay = nil
+            lock.lock(); let source = sourceLayer; lock.unlock()
+            if let source { configureOverlay(source: source, revision: revision) }
+            else { presentationEpoch = revision; submissions.reset() }
+            overlay?.displaySyncEnabled = applied.displaySync && !fixtureUnsyncedOutput
+            phaseShown = 0; phaseDropped = 0; lastReadyTime = 0
+            configurationAcknowledgement(requestID: request.requestID, error: error)
+            lock.lock()
+            // A newer request must retain the gate until its own main-queue commit.
+            if lastConfigurationRequestID == request.requestID { configurationChanging = false }
+            lock.unlock()
+            work.async { [self] in
+                configurationApplying = false
+                applyPendingConfiguration()
+            }
+        }
+    }
+    private var fixtureUnsyncedOutput: Bool {
+        ProcessInfo.processInfo.processName == "GameHookFixture" && CommandLine.arguments.contains("--unsynced-output")
+    }
 
     /// Main-thread A/B comparison without restarting or changing the game files.
     func toggleOriginalView() {
@@ -375,7 +485,7 @@ final class GameInterpolator {
                 if !reusedSession {
                     let testProxy = ProcessInfo.processInfo.processName == "GameHookFixture"
                         ? CommandLine.arguments.first { $0.hasPrefix("--proxy-width=") }.flatMap { Int($0.dropFirst(14)) } : nil
-                    let profile = GameInterpolationProfile(rawValue: ProcessInfo.processInfo.environment["SWITCHVIEWER_GAME_PROFILE"] ?? "") ?? .clarity
+                    let profile = runtimeConfiguration.profile
                     interpolator = try AppleDownsampledFrameInterpolator(width: texture.width, height: texture.height,
                         maximumProxyWidth: testProxy ?? profile.maximumProxyWidth, multiplier: interpolationOptions.multiplier)
                 }
@@ -410,8 +520,7 @@ final class GameInterpolator {
             let wasPrepared = preparedPreviousPlan != nil
             let plan = preparedPreviousPlan ?? before.flatMap { _ in playout.plan(previousTime: beforeTime, currentTime: time, readyTime: originalReadyTime) }
             let beforeSequence = previousSequence
-            pairSequence += 1
-            let sequence = pairSequence * UInt64(interpolationOptions.multiplier.rawValue)
+            let sequence = frameSequence.next(multiplier: interpolationOptions.multiplier)
             var inputEvent = GameFrameTrace.Event("input", sequence: sequence, time: time)
             inputEvent.captureID = captureID
             inputEvent.source = time
@@ -476,12 +585,18 @@ final class GameInterpolator {
             }
             guard let before, let plan else { return }
             if interpolationOptions.delayBudgetMilliseconds == 0 {
-                DispatchQueue.main.async { [self] in phaseDropped += interpolationOptions.multiplier.rawValue - 1 }
+                DispatchQueue.main.async { [self, options = interpolationOptions] in
+                    guard presentationEpoch == revision else { return }
+                    phaseDropped += options.multiplier.rawValue - 1
+                }
                 return
             }
             guard !interpolationBusy else {
                 if !interpolationOptions.usesLegacyTiming {
-                    DispatchQueue.main.async { [self] in phaseDropped += interpolationOptions.multiplier.rawValue - 1 }
+                    DispatchQueue.main.async { [self, options = interpolationOptions] in
+                        guard presentationEpoch == revision else { return }
+                        phaseDropped += options.multiplier.rawValue - 1
+                    }
                 }
                 trace.count(.interpolateSkippedBusy)
                 var event = GameFrameTrace.Event("dropped", sequence: beforeSequence + 1, time: CACurrentMediaTime())
@@ -513,6 +628,7 @@ final class GameInterpolator {
                 let delay = pressureTest && elapsed >= 4 && elapsed < 8 ? 0.015 : 0
                 work.asyncAfter(deadline: .now() + delay) { [self] in
                     interpolationBusy = false
+                    defer { applyPendingConfiguration() }
                     guard epoch == revision else { return }
                     lock.lock()
                     let paused = originalView
@@ -636,6 +752,7 @@ final class GameInterpolator {
             }, completion: { [self] result, error in
                 work.async { [self] in
                     interpolationBusy = false
+                    defer { applyPendingConfiguration() }
                     guard epoch == revision else { return }
                     if let error { trace.count(.interpolateFailed); fail(error.localizedDescription); return }
                     trace.count(.interpolateCompleted)
@@ -672,8 +789,7 @@ final class GameInterpolator {
             created.maximumDrawableCount = 2
             let fixtureUnsynced = ProcessInfo.processInfo.processName == "GameHookFixture"
                 && CommandLine.arguments.contains("--unsynced-output")
-            created.displaySyncEnabled = !fixtureUnsynced
-                && ProcessInfo.processInfo.environment["SWITCHVIEWER_GAME_DISPLAY_SYNC"] != "0"
+            created.displaySyncEnabled = !fixtureUnsynced && presentationConfiguration.displaySync
             created.actions = ["bounds": NSNull(), "position": NSNull(), "hidden": NSNull()]
             created.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
             output = created
@@ -763,8 +879,8 @@ final class GameInterpolator {
             line += " | " + window.counters.map { "\($0.label)=\($0.count)" }.joined(separator: " ")
         }
         report(line)
-        if !interpolationOptions.usesLegacyTiming {
-            let factor = interpolationOptions.multiplier.label
+        if !presentationConfiguration.interpolation.usesLegacyTiming {
+            let factor = presentationConfiguration.interpolation.multiplier.label
             report("INTERPOLATION_STATUS 目标 \(factor) · 已显示 \(phaseShown) 张插值帧，未显示 \(phaseDropped) 张。" +
                 (phaseDropped > 0 ? "可增加预算或降低倍率。" : ""))
             phaseShown = 0; phaseDropped = 0
@@ -774,6 +890,7 @@ final class GameInterpolator {
     private func schedule(_ frame: CVPixelBuffer, at deadline: Double, revision: Int,
                           sourceTime: Double, readyTime: Double, processing: Double?,
                           interval: Double, original: Bool, sequence: UInt64, expires: Double, prequeued: Bool = false, cadenceInterval: Double? = nil, feedback: DeliveryFeedback? = nil, interpolationPhase: Double = 0.5) {
+        let interpolationOptions = presentationConfiguration.interpolation
         // Submit before the intended display time: drawable acquisition and GPU
         // work overlap the next input, rather than beginning at its arrival.
         var options = hookConfiguration.presentationOptions(syncEnabled: overlay?.displaySyncEnabled)

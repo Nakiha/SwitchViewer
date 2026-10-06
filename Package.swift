@@ -11,7 +11,8 @@ let package = Package(
         .target(name: "SwitchViewerRecording"),
         .target(name: "SwitchViewerGameHook", dependencies: ["GameMetalHook", "SwitchViewerInterpolation", "SwitchViewerGamePlugins", "SwitchViewerRecording"]),
         .executableTarget(name: "GameHookFixture"),
-        .target(name: "SwitchViewerInterpolation"),
+        .target(name: "GameConfigurationNotify"),
+        .target(name: "SwitchViewerInterpolation", dependencies: ["GameConfigurationNotify"]),
         .executableTarget(
             name: "SwitchViewer",
             dependencies: ["SwitchViewerInterpolation", "SwitchViewerGamePlugins", "SwitchViewerRecording"]

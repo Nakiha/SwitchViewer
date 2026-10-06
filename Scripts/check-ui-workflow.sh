@@ -7,7 +7,7 @@ check_root="$PWD/.build/workflow-check"
 check_app="$check_root/WorkflowCheck.app"
 mkdir -p "$check_app/Contents/MacOS" "$check_app/Contents/Frameworks" "$check_app/Contents/Resources"
 cp LICENSE "$check_app/Contents/Resources/LICENSE.txt"
-swiftc -I .build/debug .build/debug/SwitchViewerInterpolation.o .build/debug/SwitchViewerGamePlugins.o .build/debug/SwitchViewerRecording.o \
+swiftc -I .build/debug -I Sources/GameConfigurationNotify/include .build/debug/GameConfigurationNotify.o .build/debug/SwitchViewerInterpolation.o .build/debug/SwitchViewerGamePlugins.o .build/debug/SwitchViewerRecording.o \
     Sources/SwitchViewer/*.swift~Sources/SwitchViewer/main.swift \
     Scripts/check-ui-workflow.swift -o "$check_app/Contents/MacOS/WorkflowCheck"
 cp .build/debug/GameHookFixture .build/debug/libSwitchViewerGameHook.dylib "$check_app/Contents/Frameworks/"
