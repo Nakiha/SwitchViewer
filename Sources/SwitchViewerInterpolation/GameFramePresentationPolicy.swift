@@ -4,6 +4,7 @@ import Foundation
 /// timers or callbacks live here. This initially preserves the v21 policy.
 public struct GameFramePresentationPolicy {
     public struct Options {
+        public var phaseSlots = false
         public var immediate = false
         public var adaptiveAdmission = false
         public var advanceOriginals = true
@@ -138,6 +139,7 @@ public struct GameFramePresentationPolicy {
         if pendingMidpoint == sequence { pendingMidpoint = nil }
     }
     public func originalWaitUntil(_ plan: Plan, at now: Double) -> Double? {
+        if plan.options.phaseSlots { return nil }
         if plan.options.legacyPairSubmission {
             return plan.sequence > 0 && pendingMidpoint == plan.sequence - 1 && now < plan.nominalSubmissionTime
                 ? plan.nominalSubmissionTime : nil

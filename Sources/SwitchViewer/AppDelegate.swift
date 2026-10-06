@@ -171,6 +171,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var frameInterpolationMenuItem: NSMenuItem!
     var frameInterpolationModeMenuItems: [NSMenuItem] = []
     var frameInterpolationMode = FrameInterpolationMode.appleProxy
+    var interpolationOptions = InterpolationOptions.load(prefix: "captureInterpolation")
+    var interpolationPerformanceStatus = ""
     var presentationPacingMode = PresentationPacingMode.cadenceLimited
     var presentationPacingMenuItems: [NSMenuItem] = []
     var frameInterpolationEngine: FrameInterpolationEngine?
@@ -188,14 +190,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let self else { return }
             self.enqueuePresentationFrames([frame], epoch: epoch, requireInterpolation: true)
         },
-        onReport: { [weak self] report in self?.diagnosticLog.append(report) })
+        onReport: { [weak self] report in self?.diagnosticLog.append(report) },
+        onStatus: { [weak self] status in DispatchQueue.main.async { self?.interpolationPerformanceStatus = status } })
     let screenContentDetector = ContentFrameCadenceDetector()
     lazy var screenPresentationScheduler = PresentationScheduler(contentTimed: true,
         onFrame: { [weak self] frame, epoch in
             guard let self else { return }
             self.enqueuePresentationFrames([frame], epoch: epoch, requireInterpolation: true)
         },
-        onReport: { [weak self] report in self?.diagnosticLog.append(report) })
+        onReport: { [weak self] report in self?.diagnosticLog.append(report) },
+        onStatus: { [weak self] status in DispatchQueue.main.async { self?.interpolationPerformanceStatus = status } })
     var frameInterpolationEnabled = false
     var screenOutputSuspended = false
     var frameInterpolationUnavailable = false

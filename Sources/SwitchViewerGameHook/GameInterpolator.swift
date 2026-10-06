@@ -98,9 +98,13 @@ final class GameInterpolator {
     private var previousTime: Double = 0
     private var previousSequence: UInt64 = 0
     private var preparedPreviousPlan: GameFramePlayoutPlanner.Plan?
+    private let interpolationOptions = InterpolationOptions.from(environment: ProcessInfo.processInfo.environment)
+    private var multiFrameDelay = MultiFrameDelayController()
     private var pressure = GameFramePressureController()
     private var lastPressureReport: Double = 0
     private var lastTraceReport = CACurrentMediaTime()
+    private var phaseShown = 0
+    private var phaseDropped = 0
     private let startedAt = CACurrentMediaTime()
     private var pressureGeneration = 0
     private var geometry = CGSize.zero
@@ -318,7 +322,7 @@ final class GameInterpolator {
         metricsStart = CACurrentMediaTime()
         lock.lock(); sourceFrameRate.reset(at: metricsStart); lock.unlock()
         displayReportTime = CACurrentMediaTime()
-        work.async { [self] in previous = nil; preparedPreviousPlan = nil; playout.reset(); pressure.reset(); pressureGeneration += 1 }
+        work.async { [self] in previous = nil; preparedPreviousPlan = nil; playout.reset(); pressure.reset(); multiFrameDelay.reset(); pressureGeneration += 1 }
         displayGraceDeadline = CACurrentMediaTime() + 1
         report(paused ? "PAUSED 已切换到游戏原画面；按 ⌥⇧I 恢复插帧" : "RESUMED 已恢复插帧，等待新画面")
     }
@@ -350,6 +354,7 @@ final class GameInterpolator {
                 previous = nil
                 preparedPreviousPlan = nil
                 pressure.reset()
+                multiFrameDelay.reset()
                 pressureGeneration += 1
                 epoch += 1
                 playout.reset()
@@ -372,7 +377,7 @@ final class GameInterpolator {
                         ? CommandLine.arguments.first { $0.hasPrefix("--proxy-width=") }.flatMap { Int($0.dropFirst(14)) } : nil
                     let profile = GameInterpolationProfile(rawValue: ProcessInfo.processInfo.environment["SWITCHVIEWER_GAME_PROFILE"] ?? "") ?? .clarity
                     interpolator = try AppleDownsampledFrameInterpolator(width: texture.width, height: texture.height,
-                        maximumProxyWidth: testProxy ?? profile.maximumProxyWidth)
+                        maximumProxyWidth: testProxy ?? profile.maximumProxyWidth, multiplier: interpolationOptions.multiplier)
                 }
                 let interpolatorEnd = CACurrentMediaTime()
                 if let size = interpolator?.proxySize { report("INTERPOLATION_PROXY width=\(size.width) height=\(size.height)") }
@@ -390,7 +395,7 @@ final class GameInterpolator {
                     trace.noteSkipped(time: overlayStart, note: String(
                         format: "overlay %.1fms（含主队列等待）", (CACurrentMediaTime() - overlayStart) * 1_000))
                 }
-                report(String(format: "READY %d×%d，Apple 2× 插帧；显示链重建 conv=%.1fms itp=%.1fms(%@) total=%.1fms",
+                report(String(format: "READY %d×%d，Apple \(interpolationOptions.multiplier.label) 插帧；显示链重建 conv=%.1fms itp=%.1fms(%@) total=%.1fms",
                               texture.width, texture.height,
                               (converterEnd - rebuildStart) * 1_000,
                               (interpolatorEnd - converterEnd) * 1_000,
@@ -406,7 +411,7 @@ final class GameInterpolator {
             let plan = preparedPreviousPlan ?? before.flatMap { _ in playout.plan(previousTime: beforeTime, currentTime: time, readyTime: originalReadyTime) }
             let beforeSequence = previousSequence
             pairSequence += 1
-            let sequence = pairSequence * 2
+            let sequence = pairSequence * UInt64(interpolationOptions.multiplier.rawValue)
             var inputEvent = GameFrameTrace.Event("input", sequence: sequence, time: time)
             inputEvent.captureID = captureID
             inputEvent.source = time
@@ -416,7 +421,7 @@ final class GameInterpolator {
                                   deadline: plan.originalDeadline,
                                   expires: plan.nextOriginalDeadline, prequeued: wasPrepared)
             }
-            if let before, let plan, !wasPrepared {
+            if let before, let plan, !wasPrepared, interpolationOptions.usesLegacyTiming {
                 // During cadence warm-up only, the previous NV12 is already complete. Queue it before converting
                 // the second frame and before the Apple submit/proxy work starts.
                 DispatchQueue.main.async { [self] in
@@ -444,15 +449,20 @@ final class GameInterpolator {
             preparedPreviousPlan = before.flatMap { _ in
                 // High-rate inputs have little room to hold a future drawable;
                 // retain the existing parallel path instead of adding display lag.
-                guard let cadence, GameFramePlayoutPlanner.supportsPrequeue(interval: cadence) else { return nil }
-                guard let delay = pressure.delay(interval: cadence) else { return nil }
+                guard let cadence else { return nil }
+                let delay: Double
+                if interpolationOptions.usesLegacyTiming {
+                    guard GameFramePlayoutPlanner.supportsPrequeue(interval: cadence),
+                          let legacyDelay = pressure.delay(interval: cadence) else { return nil }
+                    delay = legacyDelay
+                } else { delay = multiFrameDelay.delay(interval: cadence, options: interpolationOptions) }
                 let now = CACurrentMediaTime()
                 if now - lastPressureReport >= 1 {
                     lastPressureReport = now
                     report(String(format: "ADAPT elapsed=%.2f delayMs=%.2f processingBudgetMs=%.2f midpointDeliveryRate=%.3f", now - startedAt, delay * 1000, pressure.processingBudget * 1000, pressure.deliveryRate ?? .nan))
                 }
                 return playout.prepareOriginal(sourceTime: time, interval: cadence, readyTime: now,
-                                               adaptiveDelay: delay)
+                                               adaptiveDelay: delay, allowShortDelay: !interpolationOptions.usesLegacyTiming)
             }
             if let prepared = preparedPreviousPlan {
                 let ready = CACurrentMediaTime()
@@ -465,7 +475,14 @@ final class GameInterpolator {
                 }
             }
             guard let before, let plan else { return }
+            if interpolationOptions.delayBudgetMilliseconds == 0 {
+                DispatchQueue.main.async { [self] in phaseDropped += interpolationOptions.multiplier.rawValue - 1 }
+                return
+            }
             guard !interpolationBusy else {
+                if !interpolationOptions.usesLegacyTiming {
+                    DispatchQueue.main.async { [self] in phaseDropped += interpolationOptions.multiplier.rawValue - 1 }
+                }
                 trace.count(.interpolateSkippedBusy)
                 var event = GameFrameTrace.Event("dropped", sequence: beforeSequence + 1, time: CACurrentMediaTime())
                 event.reason = "interpolateSkippedBusy"
@@ -475,6 +492,12 @@ final class GameInterpolator {
             interpolationBusy = true
             submittedJob = true
             trace.count(.interpolateSubmitted)
+            if !interpolationOptions.usesLegacyTiming {
+                try submitPhaseGroup(interpolator: interpolator, previous: before, current: current,
+                    beforeTime: beforeTime, currentTime: time, originalReadyTime: originalReadyTime,
+                    beforeSequence: beforeSequence, plan: plan, revision: revision, prequeued: wasPrepared)
+                return
+            }
             DispatchQueue.main.async { [self] in
                 guard presentationEpoch == revision else { return }
                 submissions.policy.beginMidpoint(beforeSequence + 1)
@@ -561,6 +584,74 @@ final class GameInterpolator {
             if submittedJob { interpolationBusy = false }
             fail(error.localizedDescription)
         }
+    }
+
+    private func submitPhaseGroup(interpolator: AppleDownsampledFrameInterpolator,
+                                  previous: CVPixelBuffer, current: CVPixelBuffer,
+                                  beforeTime: Double, currentTime: Double, originalReadyTime: Double,
+                                  beforeSequence: UInt64, plan: GameFramePlayoutPlanner.Plan,
+                                  revision: Int, prequeued: Bool) throws {
+        let interval = plan.interval
+        let sourceInterval = currentTime - beforeTime
+        let factor = interpolationOptions.multiplier.rawValue
+        let slotInterval = interval / Double(factor)
+        try interpolator.submitFrames(previous: previous, current: current,
+            previousPresentationTimeStamp: CMTime(seconds: beforeTime, preferredTimescale: 1_000_000),
+            currentPresentationTimeStamp: CMTime(seconds: currentTime, preferredTimescale: 1_000_000),
+            onFrame: { [self] buffer, phase, processingMS in
+                let ready = CACurrentMediaTime()
+                work.async { [self] in
+                    guard epoch == revision else { return }
+                    multiFrameDelay.record(phase: phase, interval: sourceInterval, readySeconds: max(0, ready - currentTime))
+                    generated += 1
+                    let index = Int((phase * Double(factor)).rounded())
+                    let sequence = beforeSequence + UInt64(index)
+                    let target = plan.originalDeadline + phase * interval
+                    let expires = min(plan.nextOriginalDeadline, target + slotInterval)
+                    var event = GameFrameTrace.Event("phaseReady", sequence: sequence, time: ready)
+                    event.original = false; event.multiplier = factor; event.phase = phase
+                    event.source = beforeTime; event.currentSource = currentTime
+                    event.deadline = target; event.expires = expires; event.processing = processingMS / 1000
+                    frameTrace.record(event)
+                    DispatchQueue.main.async { [self] in
+                        guard !originalView, !interpolationFailed, presentationEpoch == revision else { return }
+                        guard CACurrentMediaTime() < expires else {
+                            phaseDropped += 1
+                            trace.count(.midpointDroppedNotUseful)
+                            return
+                        }
+                        let feedback = DeliveryFeedback { [self] shown in
+                            DispatchQueue.main.async { [self] in
+                                guard presentationEpoch == revision else { return }
+                                if shown { phaseShown += 1 } else { phaseDropped += 1 }
+                            }
+                        }
+                        lastReadyTime = CACurrentMediaTime()
+                        schedule(buffer, at: target, revision: revision, sourceTime: beforeTime,
+                            readyTime: ready, processing: processingMS, interval: sourceInterval,
+                            original: false, sequence: sequence, expires: expires, prequeued: prequeued,
+                            cadenceInterval: interval, feedback: feedback, interpolationPhase: phase)
+                    }
+                }
+            }, completion: { [self] result, error in
+                work.async { [self] in
+                    interpolationBusy = false
+                    guard epoch == revision else { return }
+                    if let error { trace.count(.interpolateFailed); fail(error.localizedDescription); return }
+                    trace.count(.interpolateCompleted)
+                    if let result {
+                        DispatchQueue.main.async { [self] in
+                            guard presentationEpoch == revision else { return }
+                            processingSamples.append(result.processingMilliseconds)
+                            if processingSamples.count > 120 { processingSamples.removeFirst(processingSamples.count - 120) }
+                        }
+                    }
+                    if CACurrentMediaTime() - lastReport > 2 {
+                        lastReport = CACurrentMediaTime()
+                        report("ACTIVE multiplier=\(factor) generated=\(generated) processingMs=\(Int(result?.processingMilliseconds ?? 0))")
+                    }
+                }
+            })
     }
 
     private func configureOverlay(source: CAMetalLayer, revision: Int) {
@@ -672,23 +763,40 @@ final class GameInterpolator {
             line += " | " + window.counters.map { "\($0.label)=\($0.count)" }.joined(separator: " ")
         }
         report(line)
+        if !interpolationOptions.usesLegacyTiming {
+            let factor = interpolationOptions.multiplier.label
+            report("INTERPOLATION_STATUS 目标 \(factor) · 已显示 \(phaseShown) 张插值帧，未显示 \(phaseDropped) 张。" +
+                (phaseDropped > 0 ? "可增加预算或降低倍率。" : ""))
+            phaseShown = 0; phaseDropped = 0
+        }
     }
 
     private func schedule(_ frame: CVPixelBuffer, at deadline: Double, revision: Int,
                           sourceTime: Double, readyTime: Double, processing: Double?,
-                          interval: Double, original: Bool, sequence: UInt64, expires: Double, prequeued: Bool = false, cadenceInterval: Double? = nil, feedback: DeliveryFeedback? = nil) {
+                          interval: Double, original: Bool, sequence: UInt64, expires: Double, prequeued: Bool = false, cadenceInterval: Double? = nil, feedback: DeliveryFeedback? = nil, interpolationPhase: Double = 0.5) {
         // Submit before the intended display time: drawable acquisition and GPU
         // work overlap the next input, rather than beginning at its arrival.
-        let options = hookConfiguration.presentationOptions(syncEnabled: overlay?.displaySyncEnabled)
+        var options = hookConfiguration.presentationOptions(syncEnabled: overlay?.displaySyncEnabled)
+        if !interpolationOptions.usesLegacyTiming {
+            options.phaseSlots = true
+            options.advanceOriginals = false
+            options.correctCadence = false
+            options.immediate = false
+            options.minimumCadenceGap = false
+        }
         let submissionGeneration = submissions.generation
         let plan = submissions.policy.plan(sequence: sequence, original: original, target: deadline,
-            expires: expires, interval: cadenceInterval ?? interval, prequeued: prequeued, options: options)
+            expires: expires, interval: interpolationOptions.usesLegacyTiming ? (cadenceInterval ?? interval) : (cadenceInterval ?? interval) / Double(interpolationOptions.multiplier.rawValue), prequeued: prequeued, options: options)
         let immediateOutput = options.immediate
         let adaptiveAdmission = options.adaptiveAdmission
         let lead = plan.lead
         let early = plan.advance
         let phaseDelay = plan.phaseDelay
         var scheduledEvent = GameFrameTrace.Event("scheduled", sequence: sequence, time: CACurrentMediaTime())
+        if !interpolationOptions.usesLegacyTiming {
+            scheduledEvent.original = original; scheduledEvent.multiplier = interpolationOptions.multiplier.rawValue
+            scheduledEvent.phase = original ? 0 : interpolationPhase
+        }
         scheduledEvent.source = sourceTime
         scheduledEvent.ready = readyTime
         scheduledEvent.deadline = deadline
@@ -813,6 +921,10 @@ final class GameInterpolator {
                     (adaptiveAdmission ? "unsyncedAdaptive" : (immediateOutput ? "unsyncedImmediate" : "timedCalibration"))
                 if minimumDuration > 0 { submittedEvent.minimumDuration = minimumDuration }
                 submittedEvent.drawableID = UInt64(drawable.drawableID)
+                if !interpolationOptions.usesLegacyTiming {
+                    submittedEvent.original = original; submittedEvent.multiplier = interpolationOptions.multiplier.rawValue
+                    submittedEvent.phase = original ? 0 : interpolationPhase
+                }
                 submittedEvent.source = sourceTime
                 submittedEvent.requested = requestedTime
                 submittedEvent.deadline = deadline
@@ -840,7 +952,7 @@ final class GameInterpolator {
                         feedback?.finish(false); return
                     }
                     comparisonRecorder.append(frame, track: .processed,
-                        hostTime: sourceTime + (original ? 0 : interval / 2), generated: !original,
+                        hostTime: sourceTime + (original ? 0 : interval * interpolationPhase), generated: !original,
                         referenceAspect: recordingAspect)
                     trace.notePresented(time: presented.presentedTime, sequence: sequence,
                                         sourceTime: sourceTime, submitTime: submitTime, deadline: deadline,
@@ -849,6 +961,10 @@ final class GameInterpolator {
                     var presentedEvent = GameFrameTrace.Event("presented", sequence: sequence, time: presented.presentedTime)
                     presentedEvent.drawableID = UInt64(presented.drawableID)
                     presentedEvent.callbackTime = CACurrentMediaTime()
+                    if !interpolationOptions.usesLegacyTiming {
+                        presentedEvent.original = original; presentedEvent.multiplier = interpolationOptions.multiplier.rawValue
+                        presentedEvent.phase = original ? 0 : interpolationPhase
+                    }
                     presentedEvent.source = sourceTime
                     presentedEvent.ready = readyTime
                     presentedEvent.deadline = deadline

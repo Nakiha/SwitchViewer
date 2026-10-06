@@ -70,8 +70,10 @@ def analyze(events):
         shown.append(presented)
         submitted = stages.get('submitted')
         gpu = stages.get('gpuComplete')
-        role = 'original' if sequence % 2 == 0 else 'midpointReference'
-        if sequence % 2 == 0:
+        is_original = presented.get('original', sequence % 2 == 0)
+        multiplier = presented.get('multiplier', 2)
+        role = 'original' if is_original else 'midpointReference'
+        if is_original:
             capture = stages.get('input', {}).get('captureID')
             native = captures.get(capture, {}).get('nativePresented')
             if native:
@@ -84,10 +86,10 @@ def analyze(events):
             samples[role + 'SubmitAgeMs'].append((submitted['time'] - presented['source']) * 1000)
             samples[role + 'SubmitToDisplayMs'].append((presented['time'] - submitted['time']) * 1000)
             converted = stages.get('originalReady')
-            if sequence % 2 == 0 and converted:
+            if is_original and converted:
                 samples['originalConvertedToSubmitMs'].append((submitted['time'] - converted['time']) * 1000)
-            following = frames.get(sequence + 2, {}).get('input')
-            if sequence % 2 == 0 and following:
+            following = frames.get(sequence + multiplier, {}).get('input')
+            if is_original and following:
                 samples['originalNextInputToDisplayMs'].append((presented['time'] - following['time']) * 1000)
                 samples['originalSubmittedBeforeNextInputMs'].append((following['time'] - submitted['time']) * 1000)
         commit = stages.get('commandCommitBegin')
@@ -157,7 +159,7 @@ def analyze(events):
             samples['drawableAcquireMs'].append((acquisition['time'] - acquisition['ready']) * 1000)
             if queued:
                 samples['drawableQueueMs'].append((acquisition['ready'] - queued['time']) * 1000)
-        ready = stages.get('midpointReady')
+        ready = stages.get('phaseReady') or stages.get('midpointReady')
         if ready:
             samples['pipelineProcessingMs'].append(ready['processing'] * 1000)
             if 'algorithm' in ready:

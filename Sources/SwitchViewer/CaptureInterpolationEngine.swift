@@ -89,6 +89,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
     private var appleProxyInterpolator: AppleDownsampledFrameInterpolator?
     private var activeBackend: String?
     private var mode: FrameInterpolationMode = .appleProxy
+    private var options = InterpolationOptions()
 
     init(onRepeatedGameFrameSkipped: @escaping () -> Void = {},
          onCadenceChanged: @escaping (Double?) -> Void = { _ in },
@@ -203,7 +204,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                                     time: CMTimeGetSeconds(submission.presentationTimeStamp))
         if result.isDuplicate {
             onRepeatedGameFrameSkipped()
-            submission.completion(nil, nil, nil)
+            submission.completion(nil, nil, nil, nil)
             return
         }
         let previous = lastContentFrame
@@ -253,6 +254,20 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         }
     }
 
+    func setOptions(_ options: InterpolationOptions) {
+        queue.async {
+            guard self.options != options else { return }
+            self.options = options
+            self.appleProxyInterpolator = nil
+            self.pending.removeAll(keepingCapacity: true)
+            self.recentCaptureFrames.removeAll(keepingCapacity: true)
+            self.lastContentFrame = nil
+            self.cadenceDetector.reset(); self.contentCadenceDetector.reset()
+            self.processingDisabledError = nil
+            self.sessionSetupError = nil
+        }
+    }
+
     func setMode(_ mode: FrameInterpolationMode) {
         queue.async {
             guard self.mode != mode else { return }
@@ -261,7 +276,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             self.latestSubmission = nil
             self.submissionLock.unlock()
             for input in self.pending {
-                input.completion(nil, nil, nil)
+                input.completion(nil, nil, nil, nil)
             }
             self.pending.removeAll(keepingCapacity: true)
             self.recentCaptureFrames.removeAll(keepingCapacity: true)
@@ -286,7 +301,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let queueMilliseconds = max(0, (processStartUptime - input.submittedAtUptime) * 1_000
                                     - input.cadenceMilliseconds)
         if processingDisabledError != nil {
-            input.completion(nil, nil, nil)
+            input.completion(nil, nil, nil, nil)
             processNext()
             return
         }
@@ -294,13 +309,13 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             if input.repeatedGameFrame {
                 onRepeatedGameFrameSkipped()
             }
-            input.completion(nil, nil, nil)
+            input.completion(nil, nil, nil, nil)
             processNext()
             return
         }
         guard let previousBuffer = input.previousBuffer,
               let previousPresentationTimeStamp = input.previousPresentationTimeStamp else {
-            input.completion(nil, nil, nil)
+            input.completion(nil, nil, nil, nil)
             processNext()
             return
         }
@@ -315,18 +330,23 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             onTimingReport("插帧输入跳过; 原因=时间戳非递增或间隔超出 1 秒; "
                            + String(format: "previousPTS=%.6f; currentPTS=%.6f",
                                     previousSeconds, currentSeconds))
-            input.completion(nil, nil, nil)
+            input.completion(nil, nil, nil, nil)
             processNext()
             return
         }
 
+        if options.delayBudgetMilliseconds == 0 {
+            input.completion(nil, nil, nil, nil)
+            processNext()
+            return
+        }
         let selectedMode = mode
         if selectedMode == .appleLowLatency,
            !canUseAppleLowLatencyFrame(width: CVPixelBufferGetWidth(input.buffer),
                                       height: CVPixelBufferGetHeight(input.buffer),
                                       pixelFormat: CVPixelBufferGetPixelFormatType(input.buffer)) {
             selectBackend("Apple 低延迟插帧不可用（需 1920×1080、受支持的 NV12 格式）")
-            input.completion(nil, nil, nil)
+            input.completion(nil, nil, nil, nil)
             processNext()
             return
         }
@@ -335,8 +355,13 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                          height: CVPixelBufferGetHeight(input.buffer),
                                          pixelFormat: CVPixelBufferGetPixelFormatType(input.buffer)) {
             selectBackend("Apple 代理插帧不可用（需至少 1024×576 的 NV12）")
-            input.completion(nil, nil, nil)
+            input.completion(nil, nil, nil, nil)
             processNext()
+            return
+        }
+        if options.multiplier != .two {
+            processMultiple(input, previous: previousBuffer, previousTime: previousPresentationTimeStamp,
+                            interval: CMTimeGetSeconds(interval))
             return
         }
         if selectedMode == .appleProxy {
@@ -402,11 +427,11 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                 result?.usedSeparateProcessorSubmission ?? false))
                         if let errorMessage {
                             self.processingDisabledError = errorMessage
-                            input.completion(nil, errorMessage, nil)
+                            input.completion(nil, errorMessage, nil, nil)
                         } else if let result {
-                            input.completion(result.pixelBuffer, nil, frameDuration)
+                            input.completion(result.pixelBuffer, nil, frameDuration, nil)
                         } else {
-                            input.completion(nil, "Apple 代理插帧没有生成输出帧", nil)
+                            input.completion(nil, "Apple 代理插帧没有生成输出帧", nil, nil)
                         }
                         self.finishCurrentAndContinue()
                     }
@@ -414,7 +439,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
             } catch {
                 let errorMessage = "Apple 代理插帧失败：\(String(describing: error))"
                 processingDisabledError = errorMessage
-                input.completion(nil, errorMessage, nil)
+                input.completion(nil, errorMessage, nil, nil)
                 finishCurrentAndContinue()
             }
             return
@@ -428,7 +453,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                                                        presentationTimeStamp: input.presentationTimeStamp),
               let previousFrame = VTFrameProcessorFrame(buffer: previousBuffer,
                                                         presentationTimeStamp: previousPresentationTimeStamp) else {
-            input.completion(nil, "创建插帧输入帧失败", nil)
+            input.completion(nil, "创建插帧输入帧失败", nil, nil)
             processNext()
             return
         }
@@ -437,7 +462,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
         let poolStatus = outputPool.map { CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, $0, &outputBuffer) }
             ?? kCVReturnInvalidPixelBufferAttributes
         guard poolStatus == kCVReturnSuccess, let outputBuffer else {
-            input.completion(nil, "创建插帧输出缓冲失败 status=\(poolStatus)", nil)
+            input.completion(nil, "创建插帧输出缓冲失败 status=\(poolStatus)", nil, nil)
             processNext()
             return
         }
@@ -450,7 +475,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                 previousFrame: previousFrame,
                 interpolationPhase: [0.5],
                 destinationFrames: [destination]) else {
-            input.completion(nil, "创建插帧参数失败", nil)
+            input.completion(nil, "创建插帧参数失败", nil, nil)
             processNext()
             return
         }
@@ -492,12 +517,45 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
                 if let processorError { self.processingDisabledError = processorError }
                 input.completion(error == nil ? outputBuffer : nil,
                                  processorError,
-                                 frameDuration)
+                                 frameDuration, nil)
                 if processorError != nil {
                     self.endVideoToolboxSession()
                 }
                 self.finishCurrentAndContinue()
             }
+        }
+    }
+
+    private func processMultiple(_ input: Input, previous: CVPixelBuffer, previousTime: CMTime, interval: Double) {
+        do {
+            endVideoToolboxSession()
+            let selectedOptions = options
+            let interpolator: AppleDownsampledFrameInterpolator
+            if let existing = appleProxyInterpolator { interpolator = existing }
+            else {
+                interpolator = try AppleDownsampledFrameInterpolator(
+                    width: CVPixelBufferGetWidth(input.buffer), height: CVPixelBufferGetHeight(input.buffer),
+                    multiplier: selectedOptions.multiplier)
+                appleProxyInterpolator = interpolator
+            }
+            selectBackend("Apple \(selectedOptions.multiplier.label) 插帧")
+            isProcessing = true
+            try interpolator.submitFrames(previous: previous, current: input.buffer,
+                previousPresentationTimeStamp: previousTime, currentPresentationTimeStamp: input.presentationTimeStamp,
+                onFrame: { buffer, phase, _ in
+                    self.queue.async {
+                        input.completion(buffer, nil, interval / Double(selectedOptions.multiplier.rawValue),
+                                         InterpolationFramePosition(phase: phase, sourceInterval: interval))
+                    }
+                }, completion: { _, error in
+                    self.queue.async {
+                        if let error { input.completion(nil, "Apple 多倍插帧失败：\(error.localizedDescription)", nil, nil) }
+                        self.finishCurrentAndContinue()
+                    }
+                })
+        } catch {
+            input.completion(nil, "Apple 多倍插帧失败：\(error.localizedDescription)", nil, nil)
+            finishCurrentAndContinue()
         }
     }
 
@@ -512,7 +570,7 @@ final class AdaptiveFrameInterpolator: FrameInterpolationEngine {
 
     private func fail(_ input: Input, message: String) {
         processingDisabledError = message
-        input.completion(nil, message, nil)
+        input.completion(nil, message, nil, nil)
         endVideoToolboxSession()
         processNext()
     }

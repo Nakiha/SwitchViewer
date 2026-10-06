@@ -40,16 +40,16 @@ public struct GameFramePlayoutPlanner {
     /// otherwise a shorter original delay would discard nearly every midpoint.
     /// Each prediction is anchored to its input, so missed frames cannot build a queue.
     public func prepareOriginal(sourceTime: Double, interval: Double, readyTime: Double,
-                                processingTime: Double = 0.017, adaptiveDelay: Double? = nil) -> Plan? {
+                                processingTime: Double = 0.017, adaptiveDelay: Double? = nil, allowShortDelay: Bool = false) -> Plan? {
         guard sourceTime.isFinite, interval.isFinite, readyTime.isFinite, processingTime.isFinite,
               processingTime >= 0,
               interval > 0, interval < 0.2, readyTime >= sourceTime else { return nil }
-        if let adaptiveDelay, !adaptiveDelay.isFinite || adaptiveDelay < interval { return nil }
+        if let adaptiveDelay, !adaptiveDelay.isFinite || adaptiveDelay < (allowShortDelay ? 0 : interval) { return nil }
         let cadenceDelay = interval + max(interval / 4, 0.025 - interval / 2)
         // Under GPU load, retain enough time for the observed interpolation job
         // to submit before the following original, instead of losing all midpoints.
         let delay = adaptiveDelay ?? max(cadenceDelay, processingTime + Self.submissionLead(interval: interval) + 0.002)
-        let start = max(sourceTime + delay, readyTime + Self.submissionLead(interval: interval))
+        let start = max(sourceTime + delay, readyTime + (allowShortDelay ? 0 : Self.submissionLead(interval: interval)))
         return Plan(originalDeadline: start, midpointDeadline: start + interval / 2,
                     nextOriginalDeadline: start + interval, interval: interval)
     }

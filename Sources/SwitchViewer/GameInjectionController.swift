@@ -26,6 +26,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private var interpolationRequest: DispatchWorkItem?
     private var interpolationRequestPending = false
     private(set) var isGameInterpolationEnabled = true
+    private(set) var interpolationPerformanceStatus = ""
     private(set) var interpolationControlStatus = ""
     var canToggleGameInterpolation: Bool { isGameRunning && supportsInterpolationControl && !interpolationRequestPending }
 
@@ -148,6 +149,10 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     var interpolationProfile: GameInterpolationProfile {
         get { GameInterpolationProfile(rawValue: UserDefaults.standard.string(forKey: "gameInterpolationProfile") ?? "") ?? .clarity }
         set { UserDefaults.standard.set(newValue.rawValue, forKey: "gameInterpolationProfile") }
+    }
+    var interpolationOptions: InterpolationOptions {
+        get { InterpolationOptions.load(prefix: "gameInterpolation") }
+        set { newValue.save(prefix: "gameInterpolation") }
     }
     var presentationCadence: GamePresentationCadence {
         get { .init(configuration: UserDefaults.standard.string(forKey: "gamePresentationCadence")) }
@@ -299,6 +304,8 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         environment["SWITCHVIEWER_GAME_HOOK"] = "1"
         environment["SWITCHVIEWER_GAME_PLUGIN"] = plugin.descriptor.id
         environment["SWITCHVIEWER_GAME_PROFILE"] = interpolationProfile.rawValue
+        environment["SWITCHVIEWER_GAME_MULTIPLIER"] = String(interpolationOptions.multiplier.rawValue)
+        environment["SWITCHVIEWER_GAME_DELAY_MS"] = interpolationOptions.delayBudgetMilliseconds.map(String.init(describing:))
         environment["SWITCHVIEWER_GAME_DISPLAY_SYNC"] = displaySyncEnabled ? "1" : "0"
         environment["SWITCHVIEWER_GAME_CADENCE"] = presentationCadence.rawValue
         if executable.lastPathComponent == "GameHookFixture" {
@@ -392,6 +399,9 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
                 frameTraceStatus = supportsTraceControl ? "" : "重启游戏以加载记录入口"
                 update("插帧库已加载，等待 Metal 游戏画面…")
             }
+            else if let status = line.range(of: "INTERPOLATION_STATUS ") {
+                interpolationPerformanceStatus = String(line[status.upperBound...])
+            }
             else if line.contains("MOVIE_RECORD ") { consumeMovieRecord(String(line)) }
             else if line.contains("FRAME_TRACE begin") {
                 traceRequest?.cancel()
@@ -455,6 +465,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         interpolationRequestPending = false
         interpolationControlStatus = ""
         isGameInterpolationEnabled = true
+        interpolationPerformanceStatus = ""
         isFrameTraceRecording = false
         frameTraceStatus = ""
         timeout?.cancel()

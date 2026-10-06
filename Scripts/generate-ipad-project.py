@@ -24,7 +24,7 @@ def ref(name):
     return uid(name)
 
 local = sorted(p.name for p in (root / 'iPad/SwitchViewerIPad').glob('*.swift'))
-shared = ['AppleDownsampledFrameInterpolator.swift', 'NV12Scaler.swift',
+shared = ['AppleDownsampledFrameInterpolator.swift', 'NV12Scaler.swift', 'InterpolationOptions.swift',
           'FrameProcessorSessionCleanup.swift', 'SourceFrameRateCounter.swift',
           'SwitchFrameCadenceDetector.swift', 'ContentFrameCadenceDetector.swift', 'TimedFrameQueue.swift', 'CaptureVideoFormat.swift']
 files = [(name, f'SwitchViewerIPad/{name}') for name in local]

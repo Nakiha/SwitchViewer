@@ -69,7 +69,7 @@ if args.check_midpoint_gate:
             frames[event['sequence']][event['kind']] = event
         if event['kind'] == 'originalSubmissionHeld':
             held.append(event)
-        if event['kind'] == 'submitted' and event['sequence'] % 2 == 0:
+        if event['kind'] == 'submitted' and event.get('original', event['sequence'] % 2 == 0):
             credit = event.get('submissionAdvance', 0)
             assert 0 <= credit <= .004001, 'Original advance exceeded its bound'
             advanced += credit > 0

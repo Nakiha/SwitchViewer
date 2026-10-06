@@ -8,6 +8,9 @@ public final class GameFrameTrace {
         public let kind: String
         public let sequence: UInt64
         public let time: Double
+        public var original: Bool?
+        public var multiplier: Int?
+        public var phase: Double?
         public var captureID: UInt64?
         public var callbackTime: Double?
         public var pendingPresentation: Int?

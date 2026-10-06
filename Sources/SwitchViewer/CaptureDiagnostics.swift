@@ -86,7 +86,7 @@ final class RollingDiagnosticsLog {
     }
 }
 
-typealias FrameInterpolationCompletion = (CVPixelBuffer?, String?, TimeInterval?) -> Void
+typealias FrameInterpolationCompletion = (CVPixelBuffer?, String?, TimeInterval?, InterpolationFramePosition?) -> Void
 
 final class PresentationFrameTiming {
     enum Stage: Hashable {

@@ -52,7 +52,9 @@ final class PresentationScheduler {
                                       qos: .userInteractive)
     private let onFrame: (PresentationFrame, Int) -> Void
     private let onReport: (String) -> Void
+    private let onStatus: (String) -> Void
     private var epoch = 0
+    private var options = InterpolationOptions()
     private var slots: [Int64: Slot] = [:]
     private var latestSource: CapturedSourceFrame?
     private var latestSourceContentRootID: UInt64?
@@ -82,12 +84,23 @@ final class PresentationScheduler {
 
     init(contentTimed: Bool = false,
          onFrame: @escaping (PresentationFrame, Int) -> Void,
-         onReport: @escaping (String) -> Void) {
+         onReport: @escaping (String) -> Void, onStatus: @escaping (String) -> Void = { _ in }) {
         self.contentTimed = contentTimed
         self.initialPlayoutDelayMilliseconds = contentTimed ? 50 : 75
         self.playoutDelayMilliseconds = self.initialPlayoutDelayMilliseconds
         self.onFrame = onFrame
         self.onReport = onReport
+        self.onStatus = onStatus
+    }
+
+    func setOptions(_ options: InterpolationOptions) {
+        queue.async {
+            self.options = options
+            self.playoutDelayMilliseconds = self.boundedDelay(self.playoutDelayMilliseconds)
+        }
+    }
+    private func boundedDelay(_ milliseconds: Double) -> Double {
+        options.usesLegacyTiming ? milliseconds : min(milliseconds, options.delayBudgetMilliseconds ?? 100)
     }
 
     func reset(epoch: Int, preservingLearnedTiming: Bool = false) {
@@ -104,7 +117,7 @@ final class PresentationScheduler {
                 self.requiredDelaySamples.removeAll(keepingCapacity: true)
                 self.renderLeadSamples.removeAll(keepingCapacity: true)
                 self.schedulerWakeLatenessSamples.removeAll(keepingCapacity: true)
-                self.playoutDelayMilliseconds = self.initialPlayoutDelayMilliseconds
+                self.playoutDelayMilliseconds = self.boundedDelay(self.initialPlayoutDelayMilliseconds)
             }
             self.midpointLateBySamples.removeAll(keepingCapacity: true)
             self.signatureCompareTimeSamples.removeAll(keepingCapacity: true)
@@ -123,7 +136,7 @@ final class PresentationScheduler {
     func offerSource(_ frame: CapturedSourceFrame) {
         queue.async {
             guard frame.epoch == self.epoch else { return }
-            if self.contentTimed, frame.mediaHostTime <= self.lastEmittedMediaTime {
+            if (self.contentTimed || !self.options.usesLegacyTiming), frame.mediaHostTime <= self.lastEmittedMediaTime {
                 self.staleFrameDropCount += 1
                 return
             }
@@ -179,7 +192,7 @@ final class PresentationScheduler {
     func offerMidpoint(_ frame: InterpolatedFrame) {
         queue.async {
             guard frame.epoch == self.epoch else { return }
-            if self.contentTimed, frame.mediaHostTime <= self.lastEmittedMediaTime {
+            if (self.contentTimed || !self.options.usesLegacyTiming), frame.mediaHostTime <= self.lastEmittedMediaTime {
                 self.staleFrameDropCount += 1
                 return
             }
@@ -255,14 +268,14 @@ final class PresentationScheduler {
         guard requiredDelaySamples.count >= 60,
               let p99 = Self.percentile(requiredDelaySamples, 0.99) else { return }
         if p99 > playoutDelayMilliseconds {
-            playoutDelayMilliseconds = contentTimed ? min(100, p99) : p99
+            playoutDelayMilliseconds = boundedDelay(contentTimed ? min(100, p99) : p99)
             lastDelayDecreaseUptime = now
             retimePendingSlots()
         } else if p99 < playoutDelayMilliseconds,
                   now - lastDelayDecreaseUptime >= 1 {
             let elapsed = now - lastDelayDecreaseUptime
             let maximumDecrease = elapsed * 1.0
-            playoutDelayMilliseconds = max(p99, playoutDelayMilliseconds - maximumDecrease)
+            playoutDelayMilliseconds = boundedDelay(max(p99, playoutDelayMilliseconds - maximumDecrease))
             lastDelayDecreaseUptime = now
         }
     }
@@ -272,7 +285,7 @@ final class PresentationScheduler {
         for offset in -2...2 {
             let candidateKey = roundedMillisecond + Int64(offset)
             if let slot = slots[candidateKey],
-               abs(slot.mediaHostTime - mediaHostTime) <= 0.002 {
+               abs(slot.mediaHostTime - mediaHostTime) <= (options.multiplier == .two ? 0.002 : 0.0005) {
                 let updatedTarget = max(slot.targetHostTime,
                                         mediaHostTime + playoutDelayMilliseconds / 1_000)
                 if updatedTarget > slot.targetHostTime {
@@ -348,7 +361,7 @@ final class PresentationScheduler {
             selected = nil
         }
         if let selected {
-            if contentTimed && slot.mediaHostTime <= lastEmittedMediaTime {
+            if (contentTimed || !options.usesLegacyTiming) && slot.mediaHostTime <= lastEmittedMediaTime {
                 staleFrameDropCount += 1
             } else {
                 lastEmittedMediaTime = slot.mediaHostTime
@@ -403,6 +416,14 @@ final class PresentationScheduler {
             onReport("屏幕内容定时; sourceUpdates=\(sourceSlotCount); midpointOffers=\(midpointSlotCount); lateMidpointDrops=\(lateMidpointDropCount); staleFrameDrops=\(staleFrameDropCount); delayMs=\(String(format: "%.1f", playoutDelayMilliseconds))")
         }
         onReport("deadline scheduler; sourceOffers=\(sourceSlotCount) midpointOffers=\(midpointSlotCount) heldSlots=\(heldSlotCount); lateMidpointDrops=\(lateMidpointDropCount); midpointLateByP50P95P99Ms=\(lateP50.map { String(format: "%.1f", $0) } ?? "无")/\(lateP95.map { String(format: "%.1f", $0) } ?? "无")/\(lateP99.map { String(format: "%.1f", $0) } ?? "无"); sourceFallbacks=\(sourceFallbackCount); midpointSupersededBySource=\(midpointSupersededBySourceCount); signatureCompare=\(signatureCompareCount); signatureDuplicate=\(signatureDuplicateCount); signatureCompareP50P95P99Ms=\(compareP50.map { String(format: "%.3f", $0) } ?? "无")/\(compareP95.map { String(format: "%.3f", $0) } ?? "无")/\(compareP99.map { String(format: "%.3f", $0) } ?? "无"); playoutDelayP99Ms=\(String(format: "%.1f", playoutDelayMilliseconds)); renderLeadP99Ms=\(String(format: "%.1f", renderLeadP99Milliseconds)); schedulerWakeLatenessP99Ms=\(wakeP99.map { String(format: "%.2f", $0) } ?? "无"); deadlineSafetyMs=\(String(format: "%.2f", deadlineSafetyMilliseconds))")
+        if !options.usesLegacyTiming {
+            let dropped = lateMidpointDropCount
+            onStatus(options.delayBudgetMilliseconds == 0
+                ? "0 ms 预算不留插帧等待，当前按原始帧呈现。"
+                : dropped > 0
+                ? "目标 \(options.multiplier.label) · \(dropped) 张插值帧超时；可增加预算或降低倍率。"
+                : "目标 \(options.multiplier.label) · 当前插值帧按时提交。实际帧率见监控。")
+        } else { onStatus("") }
         sourceSlotCount = 0
         midpointSlotCount = 0
         heldSlotCount = 0

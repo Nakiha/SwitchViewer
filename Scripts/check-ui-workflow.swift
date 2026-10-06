@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import SwitchViewerInterpolation
 
 /// In-process UI regression: exercises the real game fixture and capture-session
 /// transitions without opening the user's game or requesting device permissions.
@@ -210,6 +211,10 @@ struct WorkflowCheck {
             expect(workflowTitle.stringValue == "SwitchViewer", "selection toolbar shows the app name")
             let close = descendants(panel.contentView!).compactMap { $0 as? NSButton }.first { $0.toolTip == "收起工具栏" }!
             expect(!close.isBordered, "toolbar close icon has no glass bezel")
+            if CommandLine.arguments.contains("--check-multiframe-capture") {
+                checkCaptureMultipleFrames()
+                return
+            }
             if CommandLine.arguments.contains("--preview") { return }
             if CommandLine.arguments.contains("--preview-selection") { select(0); return }
             if CommandLine.arguments.contains("--preview-game") {
@@ -244,6 +249,46 @@ struct WorkflowCheck {
         }
         app.run()
     }
+    static func checkCaptureMultipleFrames() {
+        guard #available(macOS 26.0, *) else { exit(0) }
+        func frame(_ value: Int32) -> CVPixelBuffer {
+            var buffer: CVPixelBuffer?
+            let status = CVPixelBufferCreate(nil, 1280, 720, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary, &buffer)
+            expect(status == kCVReturnSuccess, "capture fixture buffer allocated")
+            let result = buffer!
+            CVPixelBufferLockBaseAddress(result, [])
+            for plane in 0..<2 {
+                memset(CVPixelBufferGetBaseAddressOfPlane(result, plane)!, plane == 0 ? value : 128,
+                       CVPixelBufferGetBytesPerRowOfPlane(result, plane) * CVPixelBufferGetHeightOfPlane(result, plane))
+            }
+            CVPixelBufferUnlockBaseAddress(result, [])
+            return result
+        }
+        let engine = AdaptiveFrameInterpolator()
+        let a = frame(80), b = frame(120)
+        engine.setOptions(.init(multiplier: .four, delayBudgetMilliseconds: 60))
+        let first = CMTime(value: 1, timescale: 30), second = CMTime(value: 2, timescale: 30)
+        engine.submit(a, presentationTimeStamp: first, displaySignature: nil, contentTimed: true) { _, error, _, _ in
+            expect(error == nil, "capture first frame accepted")
+            var phases: [Double] = []
+            engine.submit(b, presentationTimeStamp: second, displaySignature: nil, contentTimed: true) { buffer, error, duration, position in
+                expect(error == nil && buffer != nil, "capture generated frame returned")
+                expect(abs((duration ?? 0) - 1.0 / 120) < 0.000001, "capture frame duration follows selected factor")
+                expect(abs((position?.sourceInterval ?? 0) - 1.0 / 30) < 0.000001, "capture retains full source interval")
+                phases.append(position!.phase)
+                if phases.count == 3 {
+                    expect(phases.sorted() == [0.25, 0.5, 0.75], "capture completion forwards every interpolation phase")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        print("Capture multiframe: \(checks) checks passed")
+                        NSApp.terminate(nil)
+                    }
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { expect(false, "capture multiframe timed out") }
+    }
+
     static func captureSelection() {
         select(0)
         later {
@@ -267,12 +312,39 @@ struct WorkflowCheck {
                     expect(visible("鸣潮"), "game picker has Wuwa")
                     expect(!descendants(panel.contentView!).contains { ($0 as? NSButton)?.title == "选择游戏…" }, "no generic game picker")
                     validateLayout()
+                    checkInterpolationOptions()
                     owner.gameInjectionController.startFixture()
                     later(3) { gameRunning() }
                 }
             }
         }
     }
+    static func checkInterpolationOptions() {
+        let oldGame = owner.gameInjectionController.interpolationOptions
+        let oldCapture = owner.interpolationOptions
+        defer {
+            owner.gameInjectionController.interpolationOptions = oldGame
+            owner.applyInterpolationOptions(oldCapture)
+        }
+        let controls = descendants(panel.contentView!).compactMap { $0 as? InterpolationOptionsControl }
+        let game = controls.first { $0.identifier?.rawValue == "game-interpolation-options" }!
+        let capture = controls.first { $0.identifier?.rawValue == "capture-interpolation-options" }!
+        game.multiplier.selectItem(at: 1)
+        game.limit.state = .on; game.milliseconds.integerValue = 40
+        game.multiplier.sendAction(game.multiplier.action!, to: game.multiplier.target)
+        expect(owner.gameInjectionController.interpolationOptions == .init(multiplier: .four, delayBudgetMilliseconds: 40),
+            "game controls persist selected multiplier and latency budget")
+        expect(owner.interpolationOptions == oldCapture, "game settings do not change capture settings")
+        capture.multiplier.selectItem(at: 2)
+        capture.limit.state = .on; capture.milliseconds.integerValue = 0
+        capture.multiplier.sendAction(capture.multiplier.action!, to: capture.multiplier.target)
+        expect(owner.interpolationOptions == .init(multiplier: .eight, delayBudgetMilliseconds: 0),
+            "capture controls accept zero buffer without lowering multiplier")
+        capture.limit.state = .off
+        capture.limit.sendAction(capture.limit.action!, to: capture.limit.target)
+        expect(owner.interpolationOptions.delayBudgetMilliseconds == nil, "default timing can be restored independently of multiplier")
+    }
+
     static func gameRunning() {
         expect(panel.workflow == .game && tabs.segmentCount == 4, "game launch enters shared runtime tabs")
         expect(visible("退出游戏") && visible("开启插帧"), "game runtime has stop and interpolation controls")
@@ -411,8 +483,8 @@ struct WorkflowCheck {
             expect(rightControls.contains { $0.title == "开启插帧" }
                 && rightControls.contains { $0.title == "降低原帧清晰度以匹配插帧" },
                 "capture interpolation controls stay together in the right column")
-            expect(columns[1].height < columns[0].height - 40,
-                "short interpolation column keeps controls compact at the top")
+            expect(abs(columns[1].maxY - columns[0].maxY) < 2,
+                "interpolation controls stay aligned at the top as settings grow")
             panel.showTab(1)
             let graphModes = descendants(panel.contentView!).compactMap { $0 as? NSSegmentedControl }.first { $0.label(forSegment: 0) == "帧率" }!
             graphModes.selectedSegment = 0

@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import SwitchViewerInterpolation
 
 /// Configuration actions shared by the floating controls and preview window.
 extension AppDelegate {
@@ -81,6 +82,25 @@ extension AppDelegate {
 
     func setCaptureInterpolation(_ enabled: Bool) {
         if frameInterpolationEnabled != enabled { toggleFrameInterpolation(self) }
+    }
+
+    func applyInterpolationOptions(_ options: InterpolationOptions) {
+        frameLock.lock()
+        guard interpolationOptions != options else { frameLock.unlock(); return }
+        interpolationOptions = options
+        options.save(prefix: "captureInterpolation")
+        frameInterpolationEpoch += 1
+        let epoch = frameInterpolationEpoch
+        let engine = frameInterpolationEngine
+        frameLock.unlock()
+        interpolationPerformanceStatus = ""
+        engine?.setOptions(options)
+        engine?.reset()
+        presentationScheduler.setOptions(options)
+        screenPresentationScheduler.setOptions(options)
+        presentationScheduler.reset(epoch: epoch)
+        resetScreenTiming(epoch: epoch)
+        diagnosticLog.append("插帧配置; multiplier=\(options.multiplier.rawValue); delayBudgetMS=\(options.delayBudgetMilliseconds.map(String.init(describing:)) ?? "默认")")
     }
 
     func setConfiguredPacing(_ rawValue: Int) {

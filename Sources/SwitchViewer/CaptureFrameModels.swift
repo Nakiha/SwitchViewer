@@ -52,6 +52,7 @@ protocol FrameInterpolationEngine: AnyObject {
                 contentTimed: Bool,
                 completion: @escaping FrameInterpolationCompletion)
     func setMode(_ mode: FrameInterpolationMode)
+    func setOptions(_ options: InterpolationOptions)
     func reset()
 }
 

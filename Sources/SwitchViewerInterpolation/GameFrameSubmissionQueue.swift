@@ -54,7 +54,7 @@ public final class GameFrameSubmissionQueue {
     private func submitOriginal(_ plan: GameFramePresentationPolicy.Plan, revision: UInt64,
                                 submit: @escaping Task, onHold: @escaping (Hold) -> Void) {
         guard generation == revision else { return }
-        if !plan.options.legacyPairSubmission, plan.sequence > 0 { startMidpoint(plan.sequence - 1) }
+        if !plan.options.phaseSlots, !plan.options.legacyPairSubmission, plan.sequence > 0 { startMidpoint(plan.sequence - 1) }
         let time = now()
         if let until = policy.originalWaitUntil(plan, at: time) {
             onHold(Hold(sequence: plan.sequence, time: time, nominal: plan.nominalSubmissionTime, until: until))

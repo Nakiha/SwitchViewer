@@ -231,7 +231,8 @@ extension AppDelegate {
                             return
                         }
                         let isDeadlineCadence = gameFPS.map { abs($0 - 30) <= 2 } ?? false
-                        let schedulerSelected = self.presentationPacingMode == .deadlineScheduled
+                        let schedulerSelected = self.interpolationOptions.usesLegacyTiming
+                            && self.presentationPacingMode == .deadlineScheduled
                             && self.frameInterpolationMode == .appleProxy
                         var shouldResetScheduler = false
                         var schedulerResetReason: String?
@@ -300,6 +301,9 @@ extension AppDelegate {
                         self?.diagnosticLog.append(report)
                     })
                 newEngine?.setMode(frameInterpolationMode)
+                newEngine?.setOptions(interpolationOptions)
+                presentationScheduler.setOptions(interpolationOptions)
+                screenPresentationScheduler.setOptions(interpolationOptions)
             } else {
                 setStatus("系统插帧需要 macOS 26 或更新版本", base: false)
                 return

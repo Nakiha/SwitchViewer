@@ -10,6 +10,10 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
     private var deviceObservers: [NSObjectProtocol] = []
     private let sourceKinds = GlassChoiceControl(["采集卡", "窗口 / 屏幕"])
     private let gameProfile = NSPopUpButton()
+    private let gameInterpolationOptions = InterpolationOptionsControl(identifier: "game-interpolation-options")
+    private let captureInterpolationOptions = InterpolationOptionsControl(identifier: "capture-interpolation-options")
+    private let gameInterpolationHealth = NSTextField(wrappingLabelWithString: "")
+    private let captureInterpolationHealth = NSTextField(wrappingLabelWithString: "")
     private let gameCadence = NSPopUpButton()
     private let gameDisplaySync = NSButton(checkboxWithTitle: "垂直同步", target: nil, action: nil)
     private var cardLaunchers: NSStackView!
@@ -68,6 +72,17 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         sourceKinds.selection = owner.hasSelectedSource && owner.videoSource == .screen ? 1 : 0
         sourceKinds.onChange = { [weak self] _ in self?.selectSourceKind() }
 
+        for health in [gameInterpolationHealth, captureInterpolationHealth] {
+            health.font = .systemFont(ofSize: 11); health.textColor = .secondaryLabelColor
+        }
+        gameInterpolationOptions.onChange = { [weak self] options in
+            self?.owner?.gameInjectionController.interpolationOptions = options
+            self?.refresh()
+        }
+        captureInterpolationOptions.onChange = { [weak self] options in
+            self?.owner?.applyInterpolationOptions(options)
+            self?.refresh()
+        }
         gameProfile.addItems(withTitles: ["清晰优先（最高 1080p）", "速度优先（最高 720p）"])
         gameProfile.target = self
         gameProfile.action = #selector(changeGameProfile)
@@ -80,7 +95,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         gameCadence.action = #selector(changeGameCadence)
         gameCadence.toolTip = "帧间隔均匀优先：减少帧集中显示，但可能增加等待；响应速度优先：尽快显示。关闭垂直同步时生效，下次启动游戏生效。"
         gameProcessing = column([
-            gameInterpolation,
+            gameInterpolation, gameInterpolationOptions, gameInterpolationHealth,
             row("插帧偏好", gameProfile), row("显示同步", gameDisplaySync), row("显示节奏", gameCadence),
             NSTextField(labelWithString: "以上偏好在下次启动游戏时生效。")
         ])
@@ -124,7 +139,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
                                 field("采集卡音频", horizontal([mute, volume]))])
         let previewOptions = section("操作配置", [crop, floating, passthrough, operation,
             horizontal([action("显示画面", #selector(showPreview)), action("全屏", #selector(fullscreen))])])
-        let frameGeneration = section("插帧配置", [interpolation, field("插帧方式", backend), uniform])
+        let frameGeneration = section("插帧配置", [interpolation, field("插帧方式", backend), captureInterpolationOptions, captureInterpolationHealth, uniform])
         let operationsColumn = topAligned(previewOptions)
         captureOperations = operationsColumn
         let interpolationColumn = topAligned(frameGeneration)
@@ -376,6 +391,14 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
             targetIDs = ids; screenPicker.removeAllItems(); screenPicker.addItems(withTitles: ids)
             if !ids.isEmpty { screenPicker.selectItem(at: min(max(0, selected), ids.count - 1)) }
         }
+        gameInterpolationHealth.stringValue = owner.gameInjectionController.interpolationPerformanceStatus
+        gameInterpolationHealth.isHidden = gameInterpolationHealth.stringValue.isEmpty || !owner.gameInjectionController.isGameInterpolationEnabled
+        captureInterpolationHealth.stringValue = owner.interpolationPerformanceStatus
+        captureInterpolationHealth.isHidden = captureInterpolationHealth.stringValue.isEmpty || !owner.frameInterpolationEnabled
+        gameInterpolationOptions.update(owner.gameInjectionController.interpolationOptions)
+        captureInterpolationOptions.update(owner.interpolationOptions)
+        gameInterpolationOptions.setControlsEnabled(!owner.gameInjectionController.comparisonRecordingBusy)
+        captureInterpolationOptions.setControlsEnabled(!gameRunning && !owner.comparisonRecorder.isBusy)
         gameProfile.selectItem(at: owner.gameInjectionController.interpolationProfile == .lowLatency ? 1 : 0)
         gameProfile.isEnabled = true
         gameDisplaySync.state = owner.gameInjectionController.displaySyncEnabled ? .on : .off
@@ -417,7 +440,7 @@ final class ViewerSettingsView: NSView, NSMenuDelegate {
         gameInterpolation.toolTip = owner.gameInjectionController.interpolationControlStatus
         backend.isEnabled = owner.hasSelectedSource && !gameRunning
         uniform.isEnabled = owner.hasSelectedSource && owner.frameInterpolationMode == .appleProxy
-        pacing.isEnabled = owner.hasSelectedSource && owner.videoSource == .captureCard
+        pacing.isEnabled = owner.hasSelectedSource && owner.videoSource == .captureCard && owner.interpolationOptions.usesLegacyTiming
         color.isEnabled = owner.hasSelectedSource && !gameRunning
         crop.isEnabled = owner.hasSelectedSource && owner.videoSource == .screen
         for control in [floating, passthrough, operation] { control.isEnabled = owner.hasSelectedSource }

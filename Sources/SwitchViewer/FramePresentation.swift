@@ -87,7 +87,11 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                 range(values.compactMap { $0[keyPath: keyPath] })
             }
 
-            let ages = samples.compactMap(\.callbackToDisplayMilliseconds)
+            self.frameLock.lock()
+            let legacyTiming = self.interpolationOptions.usesLegacyTiming
+            self.frameLock.unlock()
+            let latencySamples = legacyTiming ? samples : samples.filter { !$0.isInterpolated }
+            let ages = latencySamples.compactMap(\.callbackToDisplayMilliseconds)
             let processing = samples.compactMap(\.callbackToReadyMilliseconds)
             let waits = samples.compactMap { sample -> Double? in
                 guard let total = sample.callbackToDisplayMilliseconds, let ready = sample.callbackToReadyMilliseconds else { return nil }
@@ -205,6 +209,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
         let interpolationEnabled = frameInterpolationEnabled
         let interpolationEngine = frameInterpolationEngine
         let interpolationMode = frameInterpolationMode
+        let interpolationOptions = self.interpolationOptions
         let pacingMode = presentationPacingMode
         let contentTimed = videoSource == .screen
         let deadlineCadenceActive = self.deadlineCadenceActive
@@ -258,7 +263,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
             if content.isDuplicate { return signatureSamplingMilliseconds }
         }
         if interpolationEnabled,
-           (contentTimed || (interpolationMode == .appleProxy &&
+           (contentTimed || !interpolationOptions.usesLegacyTiming || (interpolationMode == .appleProxy &&
                             pacingMode == .deadlineScheduled && deadlineCadenceActive)),
            let interpolationEngine,
            let presentationTimestampHostTime {
@@ -280,7 +285,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                                        presentationTimeStamp: presentationTimeStamp,
                                        displaySignature: displaySignature,
                                        contentTimed: contentTimed) {
-                [weak self] generated, error, halfInterval in
+                [weak self] generated, error, halfInterval, position in
                 guard let self else { return }
                 if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
                     self.recordInterpolationFailure(error)
@@ -290,15 +295,15 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                       let halfInterval, halfInterval > 0 else { return }
                 let midpointPresentationTimeStamp = CMTimeSubtract(
                     presentationTimeStamp,
-                    CMTime(seconds: halfInterval, preferredTimescale: 60_000))
+                    CMTime(seconds: position?.offsetFromCurrent ?? halfInterval, preferredTimescale: 60_000))
                 guard let midpointHostTime = self.hostTime(
                     forCaptureTimestamp: midpointPresentationTimeStamp) else {
                     self.diagnosticLog.append("deadline 插值帧丢弃; 原因=媒体时间戳无法转换到 host time")
                     return
                 }
                 let previousSourcePresentationTimeStamp = CMTimeSubtract(
-                    midpointPresentationTimeStamp,
-                    CMTime(seconds: halfInterval, preferredTimescale: 60_000))
+                    presentationTimeStamp,
+                    CMTime(seconds: position?.sourceInterval ?? (halfInterval * 2), preferredTimescale: 60_000))
                 let readyHostTime = presentationHostTimeNow()
                 scheduler.offerMidpoint(InterpolatedFrame(
                     previousSourcePresentationTimeStamp: previousSourcePresentationTimeStamp,
@@ -317,7 +322,7 @@ extension AppDelegate: AVCaptureVideoDataOutputSampleBufferDelegate {
                                        presentationTimeStamp: presentationTimeStamp,
                                        displaySignature: displaySignature,
                                        contentTimed: false) {
-                [weak self] generated, error, halfInterval in
+                [weak self] generated, error, halfInterval, position in
                 guard let self else { return }
                 if let error, self.canPresentFrame(epoch: epoch, requireInterpolation: true) {
                     self.recordInterpolationFailure(error)

@@ -8,6 +8,19 @@ spec.loader.exec_module(module)
 
 
 class FrameTraceAnalysisTests(unittest.TestCase):
+    def test_multiframe_roles_use_metadata_instead_of_even_sequence(self):
+        result, _ = module.analyze([
+            dict(kind='input', sequence=8, time=.95, source=.95),
+            dict(kind='submitted', sequence=8, time=1., original=True, multiplier=8),
+            dict(kind='presented', sequence=8, time=1.01, source=.95, original=True, multiplier=8),
+            dict(kind='submitted', sequence=10, time=1.02, original=False, multiplier=8),
+            dict(kind='presented', sequence=10, time=1.03, source=.95, original=False, multiplier=8, phase=.25),
+            dict(kind='input', sequence=16, time=.99, source=.99),
+        ])
+        self.assertAlmostEqual(result['timings']['originalAgeMs']['p50'], 60)
+        self.assertAlmostEqual(result['timings']['midpointReferenceAgeMs']['p50'], 80)
+        self.assertAlmostEqual(result['timings']['originalNextInputToDisplayMs']['p50'], 20)
+
     def test_predicted_ticks_and_confirmed_queue_are_observations(self):
         events = [
             dict(kind='displayState', sequence=0, time=.9, displayID=7),
