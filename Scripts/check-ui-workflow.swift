@@ -578,6 +578,7 @@ struct WorkflowCheck {
                 owner.gameInjectionController.stopGame()
                 later(1) {
                     expect(panel.workflow == .selection && tabs.selectedSegment == 1, "game exit returns to game picker")
+                    expect(owner.gameInjectionController.status == "游戏已退出。", "game exits normally through its application quit handler")
                     expect(visible("关于"), "game exit restores about")
                     expect(workflowTitle.stringValue == "SwitchViewer", "game exit restores the app title")
                     captureRunning()

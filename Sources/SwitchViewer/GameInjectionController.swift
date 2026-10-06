@@ -19,6 +19,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private(set) var runningGameName: String?
     private var active = false
     private var requestedStop = false
+    private var exitRequestTimeout: DispatchWorkItem?
     private var lastDisplayUpdate = Date.distantPast
     private let onReport: (String) -> Void
     private var supportsTraceControl = false
@@ -39,7 +40,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private(set) var appliedRuntimeConfiguration: GameRuntimeConfiguration?
     private(set) var gameConfigurationStatus = "运行中修改可即时生效。"
     var runningProcessID: Int32? { isGameRunning ? process?.processIdentifier : nil }
-    var canChangeConfiguration: Bool { !comparisonRecordingBusy }
+    var canChangeConfiguration: Bool { !comparisonRecordingBusy && !requestedStop }
     var desiredRuntimeConfiguration: GameRuntimeConfiguration {
         .init(interpolation: interpolationOptions, profile: interpolationProfile,
               displaySync: displaySyncEnabled, cadence: presentationCadence)
@@ -133,7 +134,7 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
     private(set) var comparisonRecordingStatus = ""
     private(set) var comparisonRecordingDirectory: URL?
     var canRecordComparison: Bool {
-        isGameRunning && supportsMovieControl && isGameInterpolationEnabled && !comparisonRecordingBusy && !configurationRequestPending && failedMovieArchive == nil
+        isGameRunning && supportsMovieControl && isGameInterpolationEnabled && !requestedStop && !comparisonRecordingBusy && !configurationRequestPending && failedMovieArchive == nil
     }
     func toggleComparisonRecording() {
         guard let process else { return }
@@ -487,13 +488,12 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
                 guard let self, self.process === child else { return }
                 let state = child.terminationStatus
                 let wasLoaded = self.loaded
-                let wasStopped = self.requestedStop
                 // Drain the final acknowledgement before discarding the log.
                 while let data = try? self.logReader?.read(upToCount: 65_536), !data.isEmpty {
                     self.consume(String(decoding: data, as: UTF8.self))
                 }
                 self.finish()
-                self.update(state == 0 || wasStopped ? "游戏已退出。" :
+                self.update(state == 0 ? "游戏已退出。" :
                     "游戏已退出（状态 \(state)）。\(wasLoaded ? "插帧库已加载，但未完成兼容性验证。" : "未确认加载成功，可能被系统或游戏保护阻止。")")
             }
         }
@@ -607,6 +607,9 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
         toolbar?.refreshConfiguration()
         onReport("游戏内插帧; \(message)") }
     private func finish() {
+        requestedStop = false
+        exitRequestTimeout?.cancel()
+        exitRequestTimeout = nil
         configurationSend?.cancel()
         configurationSend = nil
         configurationRequest?.cancel()
@@ -650,9 +653,28 @@ final class GameInjectionController: NSObject, NSWindowDelegate {
             comparisonRecordingStatus = "请先停止录制并等待保存，再退出游戏"
             toolbar?.refreshConfiguration(); return
         }
-        requestedStop = true; process?.terminate()
+        guard let process, process.isRunning else { return }
+        // Send the application's normal quit request. SIGTERM can enter a
+        // game's engine teardown while its runtime is still using resources.
+        requestedStop = true
+        guard let application = NSRunningApplication(processIdentifier: process.processIdentifier),
+              application.terminate() else {
+            requestedStop = false
+            update("无法请求游戏正常退出，请在游戏内退出。")
+            return
+        }
+        update("已请求游戏正常退出…")
+        exitRequestTimeout?.cancel()
+        let timeout = DispatchWorkItem { [weak self, weak process] in
+            guard let self, let process, self.process === process, process.isRunning else { return }
+            self.requestedStop = false
+            self.update("游戏尚未退出，请完成游戏内的退出提示，或在游戏内退出。")
+        }
+        exitRequestTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: timeout)
     }
     func shutdown() {
+        exitRequestTimeout?.cancel()
         configurationSend?.cancel()
         configurationSend = nil
         configurationRequest?.cancel()
